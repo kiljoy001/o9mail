@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise AppUser login, Vault storage, and restart unlock in a 9front VM."""
+"""Exercise AppUser login, Vault storage, lock, and reopen in a 9front VM."""
 
 import importlib.util
 import os
