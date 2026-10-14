@@ -25,13 +25,27 @@ cannot resume after a daemon restart. The delivery worker must queue securely
 or return a temporary failure until unlock; an eventual device-held recipient
 key or public-key envelope could remove that availability limit.
 
-For inbound mail, use 9front UPAS (`smtpd`, `send`, `upas/fs`) and a trusted
-local maildrop adapter. The adapter must not trust arbitrary clients on the
-AppUser session view as an SMTP delivery authority. Mail submission and mail
-reading are distinct rights. Outgoing mail should use UPAS `marshal`/`send`
-and factotum-managed server credentials where needed. SMTP/IMAP configuration
-belongs in an encrypted per-user account view, with a worker managing each
-user's polling schedule and errors.
+For inbound IMAPS mail, `upas-sync` uses a configured account from the
+authenticated view, asks an already-running `upas/fs` to open that account,
+and imports raw messages. UPAS uses the caller's factotum for the IMAP
+credential. The helper requires a mail certificate pin set before it opens a
+network connection. Only an `imaps` account is accepted. The configured
+hostname must match a separate command-line expected hostname. The account
+record is encrypted at rest and does not carry the password.
+
+Each import source key lives inside the authenticated ciphertext along with
+the raw message. This makes a message and its dedup identity one durable
+unit. Checking for a prior key decrypts up to 128 bounded messages; indexing
+and paging are future work. A digest collision or two identical deliveries
+in the same account can coalesce, so a later version should use IMAP UID and
+UIDVALIDITY as the primary source key.
+
+For SMTP delivery, use 9front UPAS (`smtpd`, `send`) and a trusted local
+maildrop adapter. That adapter must not treat arbitrary AppUser clients as
+SMTP delivery authorities. Mail submission and mail reading are distinct
+rights. Outgoing mail should use UPAS `marshal`/`send` and factotum-managed
+server credentials where needed. A scheduled IMAPS worker still needs
+per-user polling, backoff, and a way to handle locked mailboxes.
 
 The GUI will follow the Evolution pattern: account list, folder tree, message
 list, message view, composer, and a setup dialog. It will consume only the

@@ -1,0 +1,414 @@
+import "stdlib/process.o9";
+import "stdlib/string.o9";
+
+// Read no more than max bytes, including from dynamic 9P files.
+function SyncReadRaw(string path, int64 max) string {
+    string out;
+    c {
+        char *p, *buf;
+        int fd;
+        vlong n, total;
+
+        out = nil;
+        if(max > 0 && max <= 65536){
+            p = o9_string_cstr(path);
+            if(p != nil){
+                fd = open(p, OREAD);
+                free(p);
+                if(fd >= 0){
+                    buf = malloc(max + 1);
+                    if(buf != nil){
+                        total = 0;
+                        while(total <= max){
+                            n = read(fd, buf + total, max + 1 - total);
+                            if(n < 0){
+                                total = max + 1;
+                                break;
+                            }
+                            if(n == 0)
+                                break;
+                            total += n;
+                        }
+                        if(total <= max)
+                            out = o9_string_new(buf, total);
+                        free(buf);
+                    }
+                    close(fd);
+                }
+            }
+        }
+    }
+    return out;
+}
+
+// upas/fs uses /sys/lib/tls/mail as a certificate pin set. Its TLS wrapper
+// otherwise accepts a connection when that set could not be loaded.
+function SyncTrustReadyRaw() bool {
+    use { sec }
+    bool ready;
+    c {
+        Thumbprint *pins;
+        ready = 0;
+        pins = initThumbprints("/sys/lib/tls/mail", "/sys/lib/tls/mail.exclude", "x509");
+        if(pins != nil){
+            ready = 1;
+            freeThumbprints(pins);
+        }
+    }
+    return ready;
+}
+
+function SyncNameRaw(int64 kind, string value) bool {
+    bool ok;
+    c {
+        char *p;
+        vlong i, n;
+        int ch;
+
+        ok = 0;
+        if(value != nil){
+            p = o9_string_data(value);
+            n = o9_string_len(value);
+            if(kind == 0){
+                ok = n == 5 && memcmp(p, "imaps", 5) == 0;
+            }else if(kind >= 1 && kind <= 4 && n > 0 &&
+                     n <= (kind >= 3 ? 64 : 100)){
+                ok = 1;
+                for(i = 0; i < n; i++){
+                    ch = (uchar)p[i];
+                    if((ch >= 'a' && ch <= 'z') ||
+                       (ch >= 'A' && ch <= 'Z') ||
+                       (ch >= '0' && ch <= '9') ||
+                       ch == '.' || ch == '_' || ch == '-')
+                        continue;
+                    if(kind == 2 && (ch == '@' || ch == '+' || ch == '%'))
+                        continue;
+                    ok = 0;
+                    break;
+                }
+                if(p[0] == '.' || p[n-1] == '.' ||
+                   (kind == 1 && strstr(p, "..") != nil))
+                    ok = 0;
+            }
+        }
+    }
+    return ok;
+}
+
+function SyncDigestRaw(string digest) bool {
+    bool ok;
+    c {
+        char *p;
+        int i;
+
+        ok = 0;
+        if(digest != nil && o9_string_len(digest) == 40){
+            p = o9_string_data(digest);
+            ok = 1;
+            for(i = 0; i < 40; i++)
+                if(!((p[i] >= '0' && p[i] <= '9') ||
+                     (p[i] >= 'a' && p[i] <= 'f')))
+                    ok = 0;
+        }
+    }
+    return ok;
+}
+
+// Return the largest 128 numeric message directories in increasing order.
+function SyncMessageIdsRaw(string path) string {
+    string out;
+    c {
+        char *p, *name;
+        char buf[1536];
+        Dir *dirs;
+        uvlong top[128], v;
+        int fd, n, i, j, k, count, used, failed;
+
+        out = nil;
+        p = o9_string_cstr(path);
+        if(p != nil){
+            fd = open(p, OREAD);
+            free(p);
+            if(fd >= 0){
+                count = 0;
+                failed = 0;
+                while((n = dirread(fd, &dirs)) > 0){
+                    for(i = 0; i < n; i++){
+                        if(!(dirs[i].mode & DMDIR))
+                            continue;
+                        name = dirs[i].name;
+                        if(strlen(name) == 0 || strlen(name) > 10)
+                            continue;
+                        v = 0;
+                        for(j = 0; name[j] != 0; j++){
+                            if(name[j] < '0' || name[j] > '9')
+                                break;
+                            v = v * 10 + name[j] - '0';
+                        }
+                        if(name[j] != 0 || v > 0xffffffffULL)
+                            continue;
+                        if(count == 128 && v <= top[0])
+                            continue;
+                        if(count < 128){
+                            top[count] = v;
+                            count++;
+                            for(k = count - 1; k > 0; k--){
+                                if(top[k-1] <= top[k])
+                                    break;
+                                v = top[k-1];
+                                top[k-1] = top[k];
+                                top[k] = v;
+                            }
+                        }else{
+                            top[0] = v;
+                            for(k = 0; k < count - 1; k++){
+                                if(top[k] <= top[k+1])
+                                    break;
+                                v = top[k];
+                                top[k] = top[k+1];
+                                top[k+1] = v;
+                            }
+                        }
+                    }
+                    free(dirs);
+                }
+                if(n < 0)
+                    failed = 1;
+                close(fd);
+                used = 0;
+                for(i = 0; i < count; i++)
+                    used += snprint(buf + used, sizeof buf - used,
+                                    "%llud\n", top[i]);
+                if(!failed)
+                    out = o9_string_new(buf, used);
+            }
+        }
+    }
+    return out;
+}
+
+function SyncNumericRaw(string value) bool {
+    bool ok;
+    c {
+        char *p;
+        vlong i, n;
+        ok = 0;
+        if(value != nil){
+            p = o9_string_data(value);
+            n = o9_string_len(value);
+            if(n > 0 && n <= 10){
+                ok = 1;
+                for(i = 0; i < n; i++)
+                    if(p[i] < '0' || p[i] > '9')
+                        ok = 0;
+            }
+        }
+    }
+    return ok;
+}
+
+function SyncWriteRaw(string path, string data) bool {
+    bool ok;
+    c {
+        char *p;
+        int fd;
+        vlong n;
+        ok = 0;
+        p = o9_string_cstr(path);
+        if(p != nil){
+            fd = open(p, OWRITE);
+            free(p);
+            if(fd >= 0){
+                n = o9_string_len(data);
+                ok = write(fd, o9_string_data(data), n) == n;
+                close(fd);
+            }
+        }
+    }
+    return ok;
+}
+
+function SyncPushRaw(string view, string source, string raw) bool {
+    bool ok;
+    c {
+        char *base, path[1024];
+        int fd;
+        vlong n, pos, chunk;
+
+        ok = 0;
+        base = o9_string_cstr(view);
+        if(base != nil && strlen(base) < sizeof(path) - 32 &&
+           source != nil && raw != nil){
+            snprint(path, sizeof path, "%s/inbox/append", base);
+            fd = open(path, OWRITE|OTRUNC);
+            if(fd >= 0){
+                ok = 1;
+                n = o9_string_len(raw);
+                for(pos = 0; pos < n; pos += chunk){
+                    chunk = n - pos;
+                    if(chunk > 4096)
+                        chunk = 4096;
+                    if(write(fd, o9_string_data(raw) + pos, chunk) != chunk){
+                        ok = 0;
+                        break;
+                    }
+                }
+                close(fd);
+            }
+            if(ok){
+                snprint(path, sizeof path, "%s/inbox/source", base);
+                fd = open(path, OWRITE|OTRUNC);
+                if(fd < 0)
+                    ok = 0;
+                else{
+                    n = o9_string_len(source);
+                    ok = write(fd, o9_string_data(source), n) == n;
+                    close(fd);
+                }
+            }
+            if(ok){
+                snprint(path, sizeof path, "%s/inbox/commit", base);
+                fd = open(path, OWRITE|OTRUNC);
+                if(fd < 0)
+                    ok = 0;
+                else{
+                    ok = write(fd, "save", 4) == 4;
+                    close(fd);
+                }
+            }
+        }
+        free(base);
+    }
+    return ok;
+}
+
+class SyncIO {
+    method string read(string path, int64 max) {
+        Task<string> t = spawn SyncReadRaw(path, max);
+        return t.await();
+    }
+
+    method bool trustReady() {
+        Task<bool> t = spawn SyncTrustReadyRaw();
+        return t.await();
+    }
+
+    method bool name(int64 kind, string value) {
+        Task<bool> t = spawn SyncNameRaw(kind, value);
+        return t.await();
+    }
+
+    method bool digest(string value) {
+        Task<bool> t = spawn SyncDigestRaw(value);
+        return t.await();
+    }
+
+    method bool numeric(string value) {
+        Task<bool> t = spawn SyncNumericRaw(value);
+        return t.await();
+    }
+
+    method string ids(string path) {
+        Task<string> t = spawn SyncMessageIdsRaw(path);
+        return t.await();
+    }
+
+    method bool write(string path, string data) {
+        Task<bool> t = spawn SyncWriteRaw(path, data);
+        return t.await();
+    }
+
+    method bool push(string view, string source, string raw) {
+        Task<bool> t = spawn SyncPushRaw(view, source, raw);
+        return t.await();
+    }
+}
+
+main {
+    Task<string> viewArg = spawn ProcessArgRaw(2);
+    Task<string> upasArg = spawn ProcessArgRaw(3);
+    Task<string> expectedArg = spawn ProcessArgRaw(4);
+    Task<string> openedArg = spawn ProcessArgRaw(5);
+    string view = viewArg.await();
+    string upas = upasArg.await();
+    string expectedHost = expectedArg.await();
+    string openedLabel = openedArg.await();
+    bool preopened = len(openedLabel) > 0;
+    SyncIO io = new SyncIO();
+    if(len(view) == 0 || len(upas) == 0 || len(expectedHost) == 0) {
+        print("usage: upas-sync SERVICE VIEW UPAS_MOUNT EXPECTED_HOST [OPENED_LABEL]\n");
+    } else {
+        tabula account = new tabula(cat(view, "/account/current.tab"));
+        bool good = cmp(account.schema(), "o9mail_account_v1") == 0 &&
+                    account.first() != 0 &&
+                    cmp(account.get("id"), "default") == 0;
+        string protocol = account.get("protocol");
+        string host = account.get("host");
+        string login = account.get("user");
+        string folder = account.get("folder");
+        account.close();
+        if(!good || !io.name(0, protocol) || !io.name(1, host) ||
+           !io.name(2, login) || !io.name(3, folder) ||
+           (preopened && !io.name(4, openedLabel)) ||
+           cmp(host, expectedHost) != 0) {
+            print("upas-sync: invalid account or unexpected host\n");
+        } else if(!preopened && !io.trustReady()) {
+            print("upas-sync: install /sys/lib/tls/mail pins before IMAPS\n");
+        } else {
+            print("upas-sync: account ready\n");
+            string label = openedLabel;
+            if(!preopened) {
+                label = cat("o9mail", salt());
+            }
+            string remote = cat(cat(cat(cat(cat("/imaps/", host), "/"),
+                                        login), "/"), folder);
+            string ctl = cat(upas, "/ctl");
+            string openCommand = cat(cat(cat(cat("open ", remote), " "), label), "\n");
+            if(!preopened && !io.write(ctl, openCommand)) {
+                print("upas-sync: UPAS open failed\n");
+            } else {
+                string mailbox = cat(cat(upas, "/"), label);
+                string ids = io.ids(mailbox);
+                if(ids == nil) {
+                    print("upas-sync: mailbox unavailable\n");
+                } else {
+                    print("upas-sync: mailbox ready\n");
+                    String lines = new String(ids);
+                    int64 i = 0;
+                    string number = lines.field("\n", i);
+                    while(len(number) > 0 && i < 128) {
+                        if(io.numeric(number)) {
+                            string messageDir = cat(cat(mailbox, "/"), number);
+                            string digestText = io.read(cat(messageDir, "/digest"), 64);
+                            if(digestText != nil) {
+                                String d = new String(digestText);
+                                string digest = d.trim();
+                                if(io.digest(digest)) {
+                                    string raw = io.read(cat(messageDir, "/raw"), 65536);
+                                    if(raw != nil && len(raw) > 0) {
+                                        string source = cat(cat(cat(cat(cat(cat(host, "|"),
+                                                login), "|"), folder), "|"), digest);
+                                        print("upas-sync: importing ", number, "\n");
+                                        if(io.push(view, source, raw)) {
+                                            string result = io.read(cat(view, "/inbox/last"), 128);
+                                            print(number, " ", result, "\n");
+                                        } else {
+                                            print("upas-sync: import failed at ", number, "\n");
+                                        }
+                                    } else {
+                                        print("upas-sync: skipped empty or oversized ", number, "\n");
+                                    }
+                                }
+                            }
+                        }
+                        i = i + 1;
+                        number = lines.field("\n", i);
+                    }
+                }
+                if(!preopened) {
+                    io.write(ctl, cat(cat("close ", label), "\n"));
+                }
+            }
+        }
+    }
+}

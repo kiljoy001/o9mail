@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise AppUser login, Vault storage, lock, and reopen in a 9front VM."""
+"""Exercise AppUser mailboxes and a local UPAS import in a 9front VM."""
 
 import importlib.util
 import os
@@ -25,10 +25,14 @@ def main():
 
     with tempfile.TemporaryDirectory(prefix="o9mail-qemu-") as temporary:
         work = Path(temporary)
-        for name in ("mailfs", "enroll", "respond"):
+        for name in ("mailfs", "enroll", "respond", "upas-sync"):
             with (work / f"{name}.c").open("w") as output:
                 subprocess.run([str(O9 / "o9c/o9c"), f"{name}.o9"],
                                cwd=PROJECT, stdout=output, check=True)
+        with ((O9 / "o9c/test/e2e_vault.o9").open("rb") as source,
+              (work / "vault-test.c").open("wb") as output):
+            subprocess.run([str(O9 / "o9c/o9c")], cwd=O9, stdin=source,
+                           stdout=output, check=True)
         disk = work / "test.img"
         subprocess.run(["cp", "--sparse=always", sys.argv[1], disk], check=True)
         fat = f"{disk}@@{builder.ninefat_offset(disk)}"
@@ -41,7 +45,7 @@ def main():
                    "o9_view.c", "o9_tab_discard.c", "o9_crypto.c",
                    "monocypher.c", "monocypher.h", "o9_dispatch_386.s")
         for name, path in ((name, work / name) for name in
-                           ("mailfs.c", "enroll.c", "respond.c")):
+                           ("mailfs.c", "enroll.c", "respond.c", "upas-sync.c", "vault-test.c")):
             subprocess.run(["mcopy", "-i", fat, str(path),
                             f"::o9mail/{name}"], check=True)
         for name in runtime:
@@ -86,9 +90,14 @@ def main():
                     "8c -FV -DO9_HAVE_SRVRELEASE -I/tmp/o9mail -o /tmp/o9mail/mailfs.8 /tmp/o9mail/mailfs.c",
                     "8c -FV -DO9_HAVE_SRVRELEASE -I/tmp/o9mail -o /tmp/o9mail/enroll.8 /tmp/o9mail/enroll.c",
                     "8c -FV -DO9_HAVE_SRVRELEASE -I/tmp/o9mail -o /tmp/o9mail/respond.8 /tmp/o9mail/respond.c",
+                    "8c -FV -DO9_HAVE_SRVRELEASE -I/tmp/o9mail -o /tmp/o9mail/upas-sync.8 /tmp/o9mail/upas-sync.c",
+                    "8c -FV -DO9_HAVE_SRVRELEASE -I/tmp/o9mail -o /tmp/o9mail/vault-test.8 /tmp/o9mail/vault-test.c",
                     "8l -o /tmp/mailfs /tmp/o9mail/mailfs.8 /tmp/o9mail/libo9.a /386/lib/libndb.a /386/lib/libauth.a /386/lib/libmp.a /386/lib/libsec.a",
                     "8l -o /tmp/mail-enroll /tmp/o9mail/enroll.8 /tmp/o9mail/libo9.a /386/lib/libndb.a /386/lib/libauth.a /386/lib/libmp.a /386/lib/libsec.a",
                     "8l -o /tmp/mail-respond /tmp/o9mail/respond.8 /tmp/o9mail/libo9.a /386/lib/libndb.a /386/lib/libauth.a /386/lib/libmp.a /386/lib/libsec.a",
+                    "8l -o /tmp/upas-sync /tmp/o9mail/upas-sync.8 /tmp/o9mail/libo9.a /386/lib/libndb.a /386/lib/libauth.a /386/lib/libmp.a /386/lib/libsec.a",
+                    "8l -o /tmp/vault-test /tmp/o9mail/vault-test.8 /tmp/o9mail/libo9.a /386/lib/libndb.a /386/lib/libauth.a /386/lib/libmp.a /386/lib/libsec.a",
+                    "/tmp/vault-test",
                     "mkdir /tmp/o9mail-private", "chmod 700 /tmp/o9mail-private",
                     "auth/rsagen -b 2048 -t 'service=appuser app=o9mail hash=sha256' >/tmp/o9mail-key",
                     "cat /tmp/o9mail-key >/mnt/factotum/ctl",
@@ -127,11 +136,36 @@ def main():
                     "echo $mid >/tmp/mailmnt/0/view/inbox/select",
                     "cat /tmp/mailmnt/0/view/status",
                     "cat /tmp/mailmnt/0/view/inbox/message",
+                    "echo imaps >/tmp/mailmnt/0/view/account/protocol",
+                    "echo mail.example.test >/tmp/mailmnt/0/view/account/host",
+                    "echo alice@example.test >/tmp/mailmnt/0/view/account/user",
+                    "echo INBOX >/tmp/mailmnt/0/view/account/folder",
+                    "echo save >/tmp/mailmnt/0/view/account/save",
+                    "cat /tmp/mailmnt/0/view/account/current.tab",
+                    "grep mail.example.test /tmp/o9mail-private/alice/account.enc >/tmp/account-leak",
+                    "wc -c /tmp/account-leak",
+                    "mkdir /tmp/fakeupas", "mkdir /tmp/fakeupas/fixture",
+                    "mkdir /tmp/fakeupas/fixture/42",
+                    "echo 'Subject: imported-otter-3741' >/tmp/fakeupas/fixture/42/raw",
+                    "echo 0123456789abcdef0123456789abcdef01234567 >/tmp/fakeupas/fixture/42/digest",
+                    "/tmp/upas-sync sync /tmp/mailmnt/0/view /tmp/fakeupas wrong.example.test fixture",
+                    "/tmp/upas-sync sync /tmp/mailmnt/0/view /tmp/fakeupas mail.example.test fixture",
+                    "cat /tmp/mailmnt/0/view/inbox/last",
+                    "cat /tmp/mailmnt/0/view/inbox/origin",
+                    "cat /tmp/mailmnt/0/view/inbox/message",
+                    "/tmp/upas-sync sync /tmp/mailmnt/0/view /tmp/fakeupas mail.example.test fixture",
+                    "cat /tmp/mailmnt/0/view/inbox/last",
+                    "cat /tmp/mailmnt/0/view/inbox/origin",
+                    "cat /tmp/mailmnt/0/view/inbox/index.tab",
+                    "cat /tmp/mailmnt/0/view/inbox/message",
+                    "ls /tmp/o9mail-private/alice/*.enc | wc -l",
                 ):
                     guest(command, 300 if "mk libo9" in command else 180)
                 transcript = logpath.read_text(errors="replace")
                 if "ENROLL READY" not in transcript or "RESPONSE READY" not in transcript:
                     raise AssertionError("enrollment or AppUser proof failed")
+                if "binary roundtrip: 7 6d61696c00ff2a" not in transcript:
+                    raise AssertionError("Vault did not preserve binary plaintext")
                 if "state=verified" not in transcript or "principal=alice" not in transcript:
                     raise AssertionError("AppUser principal not verified")
                 if not re.search(
@@ -151,7 +185,26 @@ def main():
                     raise AssertionError("ciphertext message missing")
                 if not re.search(r"term% wc -c /tmp/mail-leak.*?\n\s*0\s+/tmp/mail-leak", transcript, re.S):
                     raise AssertionError("plaintext appeared in ciphertext")
-                print("O9MAIL VM PASS: AppUser proof, encrypted write, lock and reopen")
+                if not re.search(r"term% wc -c /tmp/account-leak.*?\n\s*0\s+/tmp/account-leak", transcript, re.S):
+                    raise AssertionError("account settings appeared in ciphertext")
+                if "host=mail.example.test" not in transcript:
+                    raise AssertionError("encrypted account did not round trip")
+                if "stored " not in transcript or "duplicate " not in transcript:
+                    raise AssertionError("UPAS import did not deduplicate")
+                if "upas-sync: invalid account or unexpected host" not in transcript:
+                    raise AssertionError("UPAS import accepted an unexpected host")
+                if not re.search(
+                    r"term% ls /tmp/o9mail-private/alice/\*\.enc \| wc -l; echo MAILEND\d+\n"
+                    r"\s*4\s*\n", transcript
+                ):
+                    raise AssertionError("duplicate sync changed message count")
+                if not re.search(
+                    r"term% cat /tmp/mailmnt/0/view/inbox/message; echo MAILEND\d+\n"
+                    r"Subject: imported-otter-3741",
+                    transcript
+                ):
+                    raise AssertionError("UPAS fixture was not processed")
+                print("O9MAIL VM PASS: AppUser, encrypted account, UPAS import and dedup")
             except Exception:
                 log.flush()
                 print(logpath.read_text(errors="replace")[-18000:])

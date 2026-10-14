@@ -1,9 +1,9 @@
 # o9mail
 
-An Objective-9C mail service for 9front. The first slice is a multiuser 9P
-mailbox with AppUser RSA authentication and encrypted message storage. It is
-deliberately a mailbox service today: SMTP/IMAP ingestion, outgoing mail, and
-the graphical client are still being built.
+An Objective-9C mail service for 9front. The current service provides AppUser
+RSA authentication, encrypted mailboxes and account settings, and an importer
+for UPAS IMAPS mailboxes. Outgoing mail and the graphical client are still
+being built.
 
 ## Current service
 
@@ -20,11 +20,17 @@ session receives its own view:
 /<session>/view/inbox/index.tab opaque message identifiers
 /<session>/view/inbox/select    write an identifier from index.tab
 /<session>/view/inbox/message   selected raw RFC 5322 message
+/<session>/view/inbox/origin    selected message's import source key
 /<session>/view/inbox/append    staged raw message bytes
+/<session>/view/inbox/source    optional stable import source key
 /<session>/view/inbox/commit    write any text to encrypt staged bytes
+/<session>/view/inbox/last      stored or duplicate, with message ID
+/<session>/view/account/current.tab  configured IMAPS account
+/<session>/view/account/{protocol,host,user,folder}  staged settings
+/<session>/view/account/save   encrypt staged settings
 ```
 
-Message bodies, headers, and metadata are encrypted together using the
+Message bodies, headers, import source keys, and account settings are encrypted using the
 Objective-9C `Vault` (Argon2id key derivation, XChaCha20-Poly1305). Each user
 has a distinct random salt and a private 0700 directory. On disk, messages
 are 0600 ciphertext files named by random identifiers. A check ciphertext
@@ -39,17 +45,59 @@ the staged message only when `inbox/commit` is written. This keeps split writes
 from turning into separate messages. The staging buffer is memory-only and
 bounded per session. Each authenticated session unlocks its own Vault; locking
 one session clears its staged data and key without changing another session.
+Imports use a source key inside the encrypted message envelope. Repeating a
+sync selects the existing message instead of storing another copy. The first
+storage format remains readable.
+
+## IMAPS account and import
+
+Unlock an authenticated view, then set all four account fields and save them:
+
+```rc
+view=/n/o9mail/0/view
+echo imaps > $view/account/protocol
+echo mail.example.com > $view/account/host
+echo alice@example.com > $view/account/user
+echo INBOX > $view/account/folder
+echo save > $view/account/save
+cat $view/account/current.tab
+```
+
+The account record contains no password. UPAS reads the matching
+`proto=pass service=imap server=<host> user=<login>` key from the user's
+factotum. Run `upas/fs` in that factotum namespace, with plumbing disabled,
+then import through the authenticated view:
+
+```rc
+upas/fs -n -p -m /mail/fs
+upas-sync sync $view /mail/fs mail.example.com
+```
+
+The final argument is the host you expect. `upas-sync` rejects a different
+host in the account file. It requires a usable `/sys/lib/tls/mail` certificate
+pin set before opening an IMAPS connection; 9front's UPAS TLS wrapper can
+otherwise proceed without certificate verification. The optional fifth
+argument names an already-open UPAS mailbox and imports from it without
+starting a connection, for example a local test mailbox.
+
+The importer reads at most the newest 128 UPAS message directories, skips
+empty or oversized messages, and uses each message's UPAS digest plus the
+account identity for encrypted deduplication. It does not delete remote mail.
+Sync is currently an explicit command; a scheduled worker and multiple
+accounts per user remain to be built.
 
 ## Build
 
-Requires Objective-9C main at or after commit `a22fc85`, including
-`serveAppUsers`, `Vault`, and the stock factotum RSA provider. On 9front with
+Requires Objective-9C main at or after commit `91ed8d6`, including
+`serveAppUsers`, the binary-safe `Vault.open`, and the stock factotum RSA
+provider. On 9front with
 `o9build` installed and the Objective-9C stdlib bound into the source tree:
 
 ```rc
 o9build mailfs.o9
 o9build enroll.o9
 o9build respond.o9
+o9build upas-sync.o9
 ```
 
 `mailfs` takes a service name, a private mailbox root, and a trusted enrollment
@@ -86,7 +134,7 @@ enrollment table under operator control; public self-enrollment would defeat
 the gate. The service does not call `Vault.openTab`, because that helper
 currently writes a temporary plaintext `.tab` file.
 
-After a daemon restart, every mailbox is locked. An incoming mail worker must
-queue or reject mail until a user unlocks it. There is no unattended decryption
-key or server escrow. See [docs/DESIGN.md](docs/DESIGN.md) for the delivery
-design and limits.
+After a daemon restart, every mailbox is locked. The importer runs only with
+an unlocked authenticated view and cannot pull unattended after a restart.
+There is no server escrow. See [docs/DESIGN.md](docs/DESIGN.md) for the
+delivery design and limits.

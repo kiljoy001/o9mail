@@ -223,6 +223,166 @@ function MailStageRaw(string old, int64 offset, string part) string {
     return out;
 }
 
+function MailAccountFieldRaw(int64 kind, string value) bool {
+    bool ok;
+    c {
+        char *p;
+        vlong i, n;
+        int ch;
+
+        ok = 0;
+        if(value != nil){
+            p = o9_string_data(value);
+            n = o9_string_len(value);
+            if(kind == 0){
+                if(n == 5 && memcmp(p, "imaps", 5) == 0)
+                    ok = 1;
+            }else if(kind >= 1 && kind <= 3 && n > 0 &&
+                     n <= (kind == 3 ? 64 : 100)){
+                ok = 1;
+                for(i = 0; i < n; i++){
+                    ch = (uchar)p[i];
+                    if((ch >= 'a' && ch <= 'z') ||
+                       (ch >= 'A' && ch <= 'Z') ||
+                       (ch >= '0' && ch <= '9') || ch == '.' ||
+                       ch == '_' || ch == '-')
+                        continue;
+                    if(kind == 2 && (ch == '@' || ch == '+' || ch == '%'))
+                        continue;
+                    ok = 0;
+                    break;
+                }
+                if(p[0] == '.' || p[n-1] == '.' ||
+                   (kind == 1 && strstr(p, "..") != nil))
+                    ok = 0;
+            }
+        }
+    }
+    return ok;
+}
+
+function MailSourceValidRaw(string source) bool {
+    bool ok;
+    c {
+        char *p;
+        vlong i, n;
+        int ch;
+
+        ok = 0;
+        if(source != nil){
+            p = o9_string_data(source);
+            n = o9_string_len(source);
+            if(n > 0 && n <= 512){
+                ok = 1;
+                for(i = 0; i < n; i++){
+                    ch = (uchar)p[i];
+                    if((ch >= 'a' && ch <= 'z') ||
+                       (ch >= 'A' && ch <= 'Z') ||
+                       (ch >= '0' && ch <= '9') ||
+                       ch == '.' || ch == '_' || ch == '-' ||
+                       ch == '@' || ch == '+' || ch == '%' || ch == '|')
+                        continue;
+                    ok = 0;
+                    break;
+                }
+            }
+        }
+    }
+    return ok;
+}
+
+// Versioned, authenticated plaintext inside Vault ciphertext. The source key
+// and message live in one file, so a crash cannot separate dedup metadata.
+function MailEnvelopeRaw(string source, string raw) string {
+    string out;
+    c {
+        vlong ns, nr;
+        char *p;
+        out = nil;
+        if(source != nil && raw != nil){
+            ns = o9_string_len(source);
+            nr = o9_string_len(raw);
+            if(ns >= 0 && ns <= 512 && nr >= 0 && nr <= 65536){
+                out = o9_string_new(nil, 10 + ns + nr);
+                if(out != nil){
+                    p = o9_string_data(out);
+                    memmove(p, "O9MAIL2\n", 8);
+                    p[8] = (ns >> 8) & 0xff;
+                    p[9] = ns & 0xff;
+                    memmove(p + 10, o9_string_data(source), ns);
+                    memmove(p + 10 + ns, o9_string_data(raw), nr);
+                }
+            }
+        }
+    }
+    return out;
+}
+
+function MailExtractRaw(string envelope) string {
+    string out;
+    c {
+        char *p;
+        vlong n, ns;
+        out = nil;
+        if(envelope != nil){
+            p = o9_string_data(envelope);
+            n = o9_string_len(envelope);
+            if(n >= 8 && memcmp(p, "O9MAIL2\n", 8) == 0){
+                if(n >= 10){
+                    ns = ((uchar)p[8] << 8) | (uchar)p[9];
+                    if(ns <= 512 && n >= 10 + ns)
+                        out = o9_string_new(p + 10 + ns, n - 10 - ns);
+                }
+            }else{
+                // Read mail written by the first o9mail storage format.
+                out = o9_string_new(p, n);
+            }
+        }
+    }
+    return out;
+}
+
+function MailSourceMatchRaw(string envelope, string source) bool {
+    bool match;
+    c {
+        char *p;
+        vlong n, ns;
+        match = 0;
+        if(envelope != nil && source != nil){
+            p = o9_string_data(envelope);
+            n = o9_string_len(envelope);
+            ns = o9_string_len(source);
+            if(ns > 0 && n >= 10 + ns &&
+               memcmp(p, "O9MAIL2\n", 8) == 0 &&
+               ((((uchar)p[8] << 8) | (uchar)p[9]) == ns) &&
+               memcmp(p + 10, o9_string_data(source), ns) == 0)
+                match = 1;
+        }
+    }
+    return match;
+}
+
+function MailOriginRaw(string envelope) string {
+    string out;
+    c {
+        char *p;
+        vlong n, ns;
+        out = o9_string_from_c("");
+        if(envelope != nil){
+            p = o9_string_data(envelope);
+            n = o9_string_len(envelope);
+            if(n >= 10 && memcmp(p, "O9MAIL2\n", 8) == 0){
+                ns = ((uchar)p[8] << 8) | (uchar)p[9];
+                if(ns <= 512 && n >= 10 + ns){
+                    o9_string_release(out);
+                    out = o9_string_new(p + 10, ns);
+                }
+            }
+        }
+    }
+    return out;
+}
+
 class MailDisk {
     method bool privateDir(string path) {
         Task<int64> t = spawn MailPrivateDirRaw(path);
@@ -263,6 +423,36 @@ class MailDisk {
         Task<string> t = spawn MailStageRaw(old, offset, part);
         return t.await();
     }
+
+    method bool accountField(int64 kind, string value) {
+        Task<bool> t = spawn MailAccountFieldRaw(kind, value);
+        return t.await();
+    }
+
+    method bool sourceValid(string value) {
+        Task<bool> t = spawn MailSourceValidRaw(value);
+        return t.await();
+    }
+
+    method string envelope(string source, string raw) {
+        Task<string> t = spawn MailEnvelopeRaw(source, raw);
+        return t.await();
+    }
+
+    method string extract(string value) {
+        Task<string> t = spawn MailExtractRaw(value);
+        return t.await();
+    }
+
+    method bool sourceMatch(string envelope, string source) {
+        Task<bool> t = spawn MailSourceMatchRaw(envelope, source);
+        return t.await();
+    }
+
+    method string origin(string envelope) {
+        Task<string> t = spawn MailOriginRaw(envelope);
+        return t.await();
+    }
 }
 
 class MailView {
@@ -271,6 +461,12 @@ class MailView {
     private dictionary<string> owners;
     private dictionary<string> selected;
     private dictionary<string> staged;
+    private dictionary<string> stagedSource;
+    private dictionary<string> lastImport;
+    private dictionary<string> accountProtocol;
+    private dictionary<string> accountHost;
+    private dictionary<string> accountUser;
+    private dictionary<string> accountFolder;
     private dictionary<Vault> vaults;
     private MailDisk disk;
 
@@ -279,6 +475,12 @@ class MailView {
         owners = new dictionary<string>();
         selected = new dictionary<string>();
         staged = new dictionary<string>();
+        stagedSource = new dictionary<string>();
+        lastImport = new dictionary<string>();
+        accountProtocol = new dictionary<string>();
+        accountHost = new dictionary<string>();
+        accountUser = new dictionary<string>();
+        accountFolder = new dictionary<string>();
         vaults = new dictionary<Vault>();
         disk = new MailDisk();
     }
@@ -366,11 +568,70 @@ class MailView {
         return result;
     }
 
+    private method string account(string session, string principal) {
+        if(!unlocked(session)) { return nil; }
+        string path = cat(userDir(principal), "/account.enc");
+        if(!disk.exists(path)) { return ""; }
+        string blob = disk.read(path, 1024);
+        if(blob == nil) { return nil; }
+        Vault v = vaults.get(session);
+        return v.open(blob);
+    }
+
+    private method string accountTab(string session, string principal) {
+        string record = account(session, principal);
+        if(record == nil) { return nil; }
+        tabula t = new tabula("o9mail_account_v1", "protocol,host,user,folder");
+        if(len(record) > 0) {
+            String fields = new String(record);
+            string protocol = fields.field("\n", 0);
+            string host = fields.field("\n", 1);
+            string login = fields.field("\n", 2);
+            string folder = fields.field("\n", 3);
+            if(!disk.accountField(0, protocol) || !disk.accountField(1, host) ||
+               !disk.accountField(2, login) || !disk.accountField(3, folder)) {
+                t.close();
+                return nil;
+            }
+            t.write("default", "protocol", protocol);
+            t.write("default", "host", host);
+            t.write("default", "user", login);
+            t.write("default", "folder", folder);
+        }
+        string result = t.serialize();
+        t.close();
+        return result;
+    }
+
+    private method bool saveAccount(string session, string principal) {
+        string protocol = accountProtocol.get(session);
+        string host = accountHost.get(session);
+        string login = accountUser.get(session);
+        string folder = accountFolder.get(session);
+        if(!disk.accountField(0, protocol) || !disk.accountField(1, host) ||
+           !disk.accountField(2, login) || !disk.accountField(3, folder)) {
+            return false;
+        }
+        string record = cat(cat(cat(cat(cat(cat(cat(protocol, "\n"), host), "\n"),
+                                  login), "\n"), folder), "\n");
+        Vault v = vaults.get(session);
+        string blob = v.seal(record);
+        if(blob == nil) { return false; }
+        string path = cat(userDir(principal), "/account.enc");
+        return disk.write(path, blob);
+    }
+
     internal method FileTree display(string id, string caller) {
         FileTree tree = new FileTree();
         owners.set(id, caller);
         selected.set(id, "");
         staged.set(id, "");
+        stagedSource.set(id, "");
+        lastImport.set(id, "");
+        accountProtocol.set(id, "");
+        accountHost.set(id, "");
+        accountUser.set(id, "");
+        accountFolder.set(id, "");
         tree.text("principal", caller, false);
         tree.live("status", false);
         tree.live("unlock", true);
@@ -379,8 +640,18 @@ class MailView {
         tree.live("inbox/index.tab", false);
         tree.live("inbox/select", true);
         tree.live("inbox/message", false);
+        tree.live("inbox/origin", false);
         tree.live("inbox/append", true);
+        tree.live("inbox/source", true);
         tree.live("inbox/commit", true);
+        tree.live("inbox/last", false);
+        tree.dir("account");
+        tree.live("account/current.tab", false);
+        tree.live("account/protocol", true);
+        tree.live("account/host", true);
+        tree.live("account/user", true);
+        tree.live("account/folder", true);
+        tree.live("account/save", true);
         return tree;
     }
 
@@ -396,14 +667,29 @@ class MailView {
         if(cmp(path, "inbox/index.tab") == 0) {
             return index(id, principal);
         }
+        if(cmp(path, "account/current.tab") == 0) {
+            return accountTab(id, principal);
+        }
+        if(cmp(path, "inbox/last") == 0) {
+            return cat(lastImport.get(id), "");
+        }
         if(cmp(path, "inbox/message") == 0) {
             if(!unlocked(id)) { return nil; }
             string mid = selected.get(id);
             if(!disk.hexId(mid)) { return nil; }
-            string blob = disk.read(cat(cat(cat(userDir(principal), "/"), mid), ".enc"), 132000);
+            string blob = disk.read(cat(cat(cat(userDir(principal), "/"), mid), ".enc"), 132256);
             if(blob == nil) { return nil; }
             Vault v = vaults.get(id);
-            return v.open(blob);
+            return disk.extract(v.open(blob));
+        }
+        if(cmp(path, "inbox/origin") == 0) {
+            if(!unlocked(id)) { return nil; }
+            string mid = selected.get(id);
+            if(!disk.hexId(mid)) { return nil; }
+            string blob = disk.read(cat(cat(cat(userDir(principal), "/"), mid), ".enc"), 132256);
+            if(blob == nil) { return nil; }
+            Vault v = vaults.get(id);
+            return disk.origin(v.open(blob));
         }
         return "";
     }
@@ -413,6 +699,7 @@ class MailView {
         if(truncate && len(text) == 0) {
             if(cmp(path, "inbox/append") == 0) {
                 staged.set(id, "");
+                stagedSource.set(id, "");
             }
             return 0;
         }
@@ -429,10 +716,40 @@ class MailView {
                 vaults.remove(id);
             }
             staged.set(id, "");
+            stagedSource.set(id, "");
             selected.set(id, "");
+            accountProtocol.set(id, "");
+            accountHost.set(id, "");
+            accountUser.set(id, "");
+            accountFolder.set(id, "");
             return len(text);
         }
         if(!unlocked(id)) { return -1; }
+        if(cmp(path, "account/protocol") == 0 ||
+           cmp(path, "account/host") == 0 ||
+           cmp(path, "account/user") == 0 ||
+           cmp(path, "account/folder") == 0) {
+            String input = new String(text);
+            string value = input.trim();
+            if(cmp(path, "account/protocol") == 0) {
+                if(!disk.accountField(0, value)) { return -1; }
+                accountProtocol.set(id, value);
+            } else if(cmp(path, "account/host") == 0) {
+                if(!disk.accountField(1, value)) { return -1; }
+                accountHost.set(id, value);
+            } else if(cmp(path, "account/user") == 0) {
+                if(!disk.accountField(2, value)) { return -1; }
+                accountUser.set(id, value);
+            } else {
+                if(!disk.accountField(3, value)) { return -1; }
+                accountFolder.set(id, value);
+            }
+            return len(text);
+        }
+        if(cmp(path, "account/save") == 0) {
+            if(!saveAccount(id, principal)) { return -1; }
+            return len(text);
+        }
         if(cmp(path, "inbox/select") == 0) {
             String input = new String(text);
             string mid = input.trim();
@@ -447,15 +764,46 @@ class MailView {
             staged.set(id, next);
             return len(text);
         }
+        if(cmp(path, "inbox/source") == 0) {
+            String input = new String(text);
+            string source = input.trim();
+            if(!disk.sourceValid(source)) { return -1; }
+            stagedSource.set(id, source);
+            return len(text);
+        }
         if(cmp(path, "inbox/commit") == 0) {
             string draft = staged.get(id);
             if(len(draft) == 0 || len(draft) > 65536) { return -1; }
             string existing = disk.ids(userDir(principal));
+            string source = stagedSource.get(id);
+            Vault v = vaults.get(id);
+            if(len(source) > 0) {
+                String lines = new String(existing);
+                int64 i = 0;
+                string candidate = lines.field("\n", i);
+                while(len(candidate) == 32 && i < 128) {
+                    string oldPath = cat(cat(cat(userDir(principal), "/"), candidate), ".enc");
+                    string oldBlob = disk.read(oldPath, 132256);
+                    if(oldBlob == nil) { return -1; }
+                    string opened = v.open(oldBlob);
+                    if(opened == nil) { return -1; }
+                    if(disk.sourceMatch(opened, source)) {
+                        selected.set(id, candidate);
+                        staged.set(id, "");
+                        stagedSource.set(id, "");
+                        lastImport.set(id, cat("duplicate ", candidate));
+                        return len(text);
+                    }
+                    i = i + 1;
+                    candidate = lines.field("\n", i);
+                }
+            }
             if(len(existing) >= 128 * 33) { return -1; }
             string mid = salt();
             if(!disk.hexId(mid)) { return -1; }
-            Vault v = vaults.get(id);
-            string blob = v.seal(draft);
+            string envelope = disk.envelope(source, draft);
+            if(envelope == nil) { return -1; }
+            string blob = v.seal(envelope);
             if(blob == nil) { return -1; }
             string pathOnDisk = cat(cat(cat(userDir(principal), "/"), mid), ".enc");
             if(!disk.write(pathOnDisk, blob)) {
@@ -464,6 +812,8 @@ class MailView {
             }
             selected.set(id, mid);
             staged.set(id, "");
+            stagedSource.set(id, "");
+            lastImport.set(id, cat("stored ", mid));
             return len(text);
         }
         return -1;
