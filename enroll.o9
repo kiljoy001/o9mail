@@ -1,0 +1,19 @@
+import "stdlib/process.o9";
+
+// Create the trusted, public enrollment table on the serving machine.
+main {
+    Task<string> pathArg = spawn ProcessArgRaw(2);
+    Task<string> nameArg = spawn ProcessArgRaw(3);
+    Task<string> modulusArg = spawn ProcessArgRaw(4);
+    Task<string> exponentArg = spawn ProcessArgRaw(5);
+    string name = nameArg.await();
+    tabula keys = new tabula("o9mail_keys_v1", "modulus,exponent");
+    keys.write(name, "modulus", modulusArg.await());
+    keys.write(name, "exponent", exponentArg.await());
+    if(writefile(pathArg.await(), keys.serialize()) != 0) {
+        print("ENROLL WRITE FAILED\n");
+    } else {
+        print("ENROLL READY\n");
+    }
+    keys.close();
+}

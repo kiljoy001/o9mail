@@ -1,0 +1,22 @@
+import "stdlib/appuser.o9";
+import "stdlib/process.o9";
+
+// Sign the server challenge with the stock factotum RSA key.
+main {
+    Task<string> nameArg = spawn ProcessArgRaw(2);
+    Task<string> modulusArg = spawn ProcessArgRaw(3);
+    Task<string> exponentArg = spawn ProcessArgRaw(4);
+    Task<string> challengeArg = spawn ProcessArgRaw(5);
+    Task<string> responseArg = spawn ProcessArgRaw(6);
+    string name = nameArg.await();
+    AppUser user = new AppUser("o9mail", name, name, "",
+                               modulusArg.await(), exponentArg.await());
+    tabula challenge = new tabula(challengeArg.await());
+    string response = user.responseTab(challenge, "mailfs");
+    challenge.close();
+    if(len(response) == 0 || writefile(responseArg.await(), response) != 0) {
+        print("RESPONSE FAILED\n");
+    } else {
+        print("RESPONSE READY\n");
+    }
+}

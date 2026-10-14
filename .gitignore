@@ -1,0 +1,7 @@
+/stdlib
+/local/
+*.8
+*.386
+*.a
+*.c.generated
+__pycache__/
