@@ -83,6 +83,10 @@ starting a connection, for example a local test mailbox.
 The importer reads at most the newest 128 UPAS message directories, skips
 empty or oversized messages, and uses each message's UPAS digest plus the
 account identity for encrypted deduplication. It does not delete remote mail.
+The normal importer keeps a mailbox open in the supplied `upas/fs` instance.
+Its name is derived from the host, login, and folder so later syncs can
+refresh and reuse it without mixing accounts. Run a dedicated `upas/fs` for
+this account and restart it after changing the account settings.
 Sync is currently an explicit command; a scheduled worker and multiple
 accounts per user remain to be built.
 
@@ -123,7 +127,11 @@ O9_ROOT=/path/to/objective-9c \
 ```
 
 Set `O9_ROOT` to a current Objective-9C checkout and `HALATHA_ROOT` if the
-Halatha checkout is outside the sibling directory.
+Halatha checkout is outside the sibling directory. This test starts a
+disposable TLS IMAP server on the host and forwards the VM's IMAPS port to it
+through QEMU. It checks two live network imports and a repeated sync, in
+addition to the local UPAS fixture. The server implements the IMAP commands
+used by UPAS for this test; no real mailbox credentials are used.
 
 ## Security boundary
 

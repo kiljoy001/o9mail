@@ -32,6 +32,9 @@ credential. The helper requires a mail certificate pin set before it opens a
 network connection. Only an `imaps` account is accepted. The configured
 hostname must match a separate command-line expected hostname. The account
 record is encrypted at rest and does not carry the password.
+The helper leaves a named UPAS mailbox open for reuse; reading its directory
+refreshes it. The current design supports one configured account per user and
+expects a dedicated `upas/fs` instance for that account.
 
 Each import source key lives inside the authenticated ciphertext along with
 the raw message. This makes a message and its dedup identity one durable

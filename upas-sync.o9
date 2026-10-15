@@ -114,6 +114,34 @@ function SyncDigestRaw(string digest) bool {
     return ok;
 }
 
+// A stable mailbox name isolates accounts even when one upas/fs instance
+// remains mounted across successive sync invocations.
+function SyncLabelRaw(string identity) string {
+    use { sec }
+    string out;
+    c {
+        uchar digest[SHA2_256dlen];
+        char name[36];
+        char *hex = "0123456789abcdef";
+        int i;
+
+        out = nil;
+        if(identity != nil && o9_string_len(identity) > 0 &&
+           o9_string_len(identity) <= 300){
+            sha2_256((uchar*)o9_string_data(identity),
+                     o9_string_len(identity), digest, nil);
+            memmove(name, "o9m", 3);
+            for(i = 0; i < 16; i++){
+                name[3 + 2*i] = hex[digest[i] >> 4];
+                name[4 + 2*i] = hex[digest[i] & 15];
+            }
+            name[35] = 0;
+            out = o9_string_new(name, 35);
+        }
+    }
+    return out;
+}
+
 // Return the largest 128 numeric message directories in increasing order.
 function SyncMessageIdsRaw(string path) string {
     string out;
@@ -303,6 +331,11 @@ class SyncIO {
         return t.await();
     }
 
+    method string label(string identity) {
+        Task<string> t = spawn SyncLabelRaw(identity);
+        return t.await();
+    }
+
     method bool numeric(string value) {
         Task<bool> t = spawn SyncNumericRaw(value);
         return t.await();
@@ -356,57 +389,64 @@ main {
             print("upas-sync: install /sys/lib/tls/mail pins before IMAPS\n");
         } else {
             print("upas-sync: account ready\n");
-            string label = openedLabel;
-            if(!preopened) {
-                label = cat("o9mail", salt());
+            // The full account identity determines the stable UPAS mount
+            // name. A changed account therefore cannot reuse stale mail.
+            string identity = cat(cat(cat(cat(host, "|"), login), "|"), folder);
+            string label = io.label(identity);
+            if(preopened) {
+                label = openedLabel;
             }
             string remote = cat(cat(cat(cat(cat("/imaps/", host), "/"),
                                         login), "/"), folder);
             string ctl = cat(upas, "/ctl");
             string openCommand = cat(cat(cat(cat("open ", remote), " "), label), "\n");
-            if(!preopened && !io.write(ctl, openCommand)) {
-                print("upas-sync: UPAS open failed\n");
-            } else {
-                string mailbox = cat(cat(upas, "/"), label);
-                string ids = io.ids(mailbox);
+            string mailbox = cat(cat(upas, "/"), label);
+            string ids = nil;
+            if(preopened) {
+                ids = io.ids(mailbox);
+            } else if(len(label) == 35) {
+                ids = io.ids(mailbox);
                 if(ids == nil) {
-                    print("upas-sync: mailbox unavailable\n");
-                } else {
-                    print("upas-sync: mailbox ready\n");
-                    String lines = new String(ids);
-                    int64 i = 0;
-                    string number = lines.field("\n", i);
-                    while(len(number) > 0 && i < 128) {
-                        if(io.numeric(number)) {
-                            string messageDir = cat(cat(mailbox, "/"), number);
-                            string digestText = io.read(cat(messageDir, "/digest"), 64);
-                            if(digestText != nil) {
-                                String d = new String(digestText);
-                                string digest = d.trim();
-                                if(io.digest(digest)) {
-                                    string raw = io.read(cat(messageDir, "/raw"), 65536);
-                                    if(raw != nil && len(raw) > 0) {
-                                        string source = cat(cat(cat(cat(cat(cat(host, "|"),
-                                                login), "|"), folder), "|"), digest);
-                                        print("upas-sync: importing ", number, "\n");
-                                        if(io.push(view, source, raw)) {
-                                            string result = io.read(cat(view, "/inbox/last"), 128);
-                                            print(number, " ", result, "\n");
-                                        } else {
-                                            print("upas-sync: import failed at ", number, "\n");
-                                        }
+                    print("upas-sync: opening mailbox\n");
+                    if(io.write(ctl, openCommand)) {
+                        ids = io.ids(mailbox);
+                    }
+                }
+            }
+            if(ids == nil) {
+                print("upas-sync: mailbox unavailable\n");
+            } else {
+                print("upas-sync: mailbox ready\n");
+                String lines = new String(ids);
+                int64 i = 0;
+                string number = lines.field("\n", i);
+                while(len(number) > 0 && i < 128) {
+                    if(io.numeric(number)) {
+                        string messageDir = cat(cat(mailbox, "/"), number);
+                        string digestText = io.read(cat(messageDir, "/digest"), 64);
+                        if(digestText != nil) {
+                            String d = new String(digestText);
+                            string digest = d.trim();
+                            if(io.digest(digest)) {
+                                string raw = io.read(cat(messageDir, "/raw"), 65536);
+                                if(raw != nil && len(raw) > 0) {
+                                    string source = cat(cat(cat(cat(cat(cat(host, "|"),
+                                            login), "|"), folder), "|"), digest);
+                                    print("upas-sync: importing ", number, "\n");
+                                    if(io.push(view, source, raw)) {
+                                        string result = io.read(cat(view, "/inbox/last"), 128);
+                                        print(number, " ", result, "\n");
                                     } else {
-                                        print("upas-sync: skipped empty or oversized ", number, "\n");
+                                        print("upas-sync: import failed at ", number, "\n");
                                     }
+                                } else {
+                                    print("upas-sync: skipped empty or oversized ", number, "\n");
                                 }
                             }
                         }
-                        i = i + 1;
-                        number = lines.field("\n", i);
                     }
-                }
-                if(!preopened) {
-                    io.write(ctl, cat(cat("close ", label), "\n"));
+                    i = i + 1;
+                    number = lines.field("\n", i);
                 }
             }
         }

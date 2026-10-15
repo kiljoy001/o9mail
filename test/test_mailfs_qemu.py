@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from live_imaps import HOST as IMAP_HOST, LOGIN as IMAP_LOGIN, PASSWORD as IMAP_PASSWORD, LiveImaps
 
 
 PROJECT = Path(__file__).resolve().parents[1]
@@ -25,6 +26,7 @@ def main():
 
     with tempfile.TemporaryDirectory(prefix="o9mail-qemu-") as temporary:
         work = Path(temporary)
+        imaps = LiveImaps(work / "imaps")
         for name in ("mailfs", "enroll", "respond", "upas-sync"):
             with (work / f"{name}.c").open("w") as output:
                 subprocess.run([str(O9 / "o9c/o9c"), f"{name}.o9"],
@@ -54,10 +56,13 @@ def main():
         for path in (O9 / "libtab").glob("*.[ch]"):
             subprocess.run(["mcopy", "-i", fat, str(path),
                             f"::o9mlib/{path.name}"], check=True)
+        subprocess.run(["mcopy", "-i", fat, str(imaps.trust),
+                        "::o9mail/mail-trust"], check=True)
 
         qemu = ["qemu-system-i386", "-m", "1024", "-display", "none",
                 "-monitor", "none", "-serial", "stdio", "-no-reboot",
-                "-netdev", "user,id=n0", "-device", "ne2k_pci,netdev=n0",
+                "-netdev", f"user,id=n0,guestfwd=tcp:{IMAP_HOST}:993-tcp:127.0.0.1:{imaps.port}",
+                "-device", "ne2k_pci,netdev=n0",
                 "-drive", f"file={disk},format=raw,if=ide,index=0"]
         if os.access("/dev/kvm", os.R_OK | os.W_OK):
             qemu.insert(1, "-enable-kvm")
@@ -66,6 +71,7 @@ def main():
             proc = subprocess.Popen(qemu, stdin=subprocess.PIPE,
                                     stdout=subprocess.PIPE,
                                     stderr=subprocess.STDOUT)
+            imaps.start()
             console = builder.Console(proc, log)
             serial = 0
 
@@ -159,8 +165,25 @@ def main():
                     "cat /tmp/mailmnt/0/view/inbox/index.tab",
                     "cat /tmp/mailmnt/0/view/inbox/message",
                     "ls /tmp/o9mail-private/alice/*.enc | wc -l",
+                    "ip/ipconfig ether /net/ether0 10.0.2.15 255.255.255.0 10.0.2.2",
+                    "mkdir /tmp/o9mail-trust",
+                    "cp /n/9fat/o9mail/mail-trust /tmp/o9mail-trust/mail",
+                    "bind -b /tmp/o9mail-trust /sys/lib/tls",
+                    f"echo 'key proto=pass service=imap server={IMAP_HOST} user={IMAP_LOGIN} !password={IMAP_PASSWORD}' >/mnt/factotum/ctl",
+                    "upas/fs -np -m /mail/fs",
+                    "echo imaps >/tmp/mailmnt/0/view/account/protocol",
+                    f"echo {IMAP_HOST} >/tmp/mailmnt/0/view/account/host",
+                    f"echo {IMAP_LOGIN} >/tmp/mailmnt/0/view/account/user",
+                    "echo INBOX >/tmp/mailmnt/0/view/account/folder",
+                    "echo save >/tmp/mailmnt/0/view/account/save",
+                    f"/tmp/upas-sync sync /tmp/mailmnt/0/view /mail/fs {IMAP_HOST}",
+                    "cat /tmp/mailmnt/0/view/inbox/index.tab >/tmp/live-index.tab",
+                    "for(id in `{awk '/^id=/{sub(/^id=/,\"\");print}' /tmp/live-index.tab}) { echo $id >/tmp/mailmnt/0/view/inbox/select; cat /tmp/mailmnt/0/view/inbox/message }",
+                    f"/tmp/upas-sync sync /tmp/mailmnt/0/view /mail/fs {IMAP_HOST}",
+                    "cat /tmp/mailmnt/0/view/inbox/last",
                 ):
-                    guest(command, 300 if "mk libo9" in command else 180)
+                    guest(command, 300 if "mk libo9" in command else
+                          60 if "upas-sync sync" in command and "/mail/fs" in command else 180)
                 transcript = logpath.read_text(errors="replace")
                 if "ENROLL READY" not in transcript or "RESPONSE READY" not in transcript:
                     raise AssertionError("enrollment or AppUser proof failed")
@@ -204,7 +227,22 @@ def main():
                     transcript
                 ):
                     raise AssertionError("UPAS fixture was not processed")
-                print("O9MAIL VM PASS: AppUser, encrypted account, UPAS import and dedup")
+                if "live-imaps-finch-7043" not in transcript or "live-imaps-heron-8261" not in transcript:
+                    raise AssertionError("live IMAPS messages were not imported")
+                live_runs = re.findall(
+                    r"term% /tmp/upas-sync sync /tmp/mailmnt/0/view /mail/fs "
+                    r"10\.0\.2\.100; echo MAILEND\d+\n(.*?)MAILEND\d+",
+                    transcript, re.S
+                )
+                if len(live_runs) != 2 or "1 stored " not in live_runs[0] or \
+                   "2 stored " not in live_runs[0] or "1 duplicate " not in live_runs[1] or \
+                   "2 duplicate " not in live_runs[1]:
+                    raise AssertionError(f"live IMAPS dedup failed: {live_runs}")
+                if imaps.commands.count("login") < 1 or imaps.commands.count("uid") < 2:
+                    raise AssertionError(f"UPAS did not fetch live IMAPS bodies: {imaps.commands}")
+                if imaps.errors:
+                    raise AssertionError(f"IMAPS server errors: {imaps.errors}")
+                print("O9MAIL VM PASS: AppUser, encrypted account, offline and live IMAPS import, dedup")
             except Exception:
                 log.flush()
                 print(logpath.read_text(errors="replace")[-18000:])
@@ -216,6 +254,7 @@ def main():
                 except subprocess.TimeoutExpired:
                     proc.kill()
                     proc.wait()
+                imaps.close()
 
 
 if __name__ == "__main__":
