@@ -121,6 +121,65 @@ It enables standalone 9front nodes to participate directly in the modern federat
 ### 6. `enroll.o9` (Recipient Enrollment)
 * Enrolls trusted recipient AppUser RSA public keys into the Tabula schema (`trusted_keys.tab`).
 
+### 7. `upas-sync.o9` (UPAS IMAPS Mailbox Importer)
+* Imports existing mailboxes from remote IMAPS servers using 9front's `upas/fs`.
+* Credentials are read directly from the user's Factotum (`proto=pass service=imap server=<host> user=<login>`).
+* Validates TLS certificate pins against `/sys/lib/tls/mail`.
+* Performs encrypted deduplication using message digests, packaging imported mail directly into the user's zero-knowledge vault.
+
+---
+
+## 9P View and Factotum Protocol Specification
+
+When a client attaches to `/srv/<service>` (e.g. `/srv/mailfs`), the connection enters an unauthenticated session gate.
+
+### 1. Challenge-Response Handshake
+```rc
+mount /srv/mailfs /mail
+sid=`{cat /mail/clone}
+echo auth <principal> > /mail/$sid/ctl
+```
+The server emits `challenge.tab` containing an ephemeral nonce tied to this session. The user proves ownership of the matching RSA private key via `factotum` (`/mnt/factotum/rpc` with `service=appuser app=o9mail role=client`):
+```rc
+respond respond <principal> $n $ek /mail/$sid/challenge.tab /tmp/response.tab
+cat /tmp/response.tab > /mail/$sid/response.tab
+```
+Upon successful verification, the session's private view tree is unlocked.
+
+### 2. Private 9P Session Tree (`/<session>/view/`)
+```text
+/<session>/view/principal          verified AppUser principal name
+/<session>/view/status             mailbox state ('locked' or 'unlocked')
+/<session>/view/unlock             write passphrase to unlock symmetric Vault
+/<session>/view/lock               write any text to clear key and lock
+/<session>/view/inbox/index.tab    opaque message identifiers
+/<session>/view/inbox/select       write identifier from index.tab to select
+/<session>/view/inbox/message      selected raw RFC 5322 message
+/<session>/view/inbox/origin       selected message's origin key (e.g. smtp:sender:mid)
+/<session>/view/inbox/append       staged raw message bytes for local injection
+/<session>/view/inbox/source       optional stable import source key
+/<session>/view/inbox/commit       write any text to encrypt and store staged bytes
+/<session>/view/inbox/last         status of last committed message
+/<session>/view/outbox/to          staged recipient address
+/<session>/view/outbox/subject     staged message subject
+/<session>/view/outbox/body        staged message body
+/<session>/view/outbox/send        write 'send' to DKIM-sign, dispatch, and archive
+/<session>/view/outbox/status      status of last send ('sent <mid>' or 'error: ...')
+/<session>/view/account/current.tab  configured remote IMAPS account
+/<session>/view/account/{protocol,host,user,folder}  staged IMAPS settings
+/<session>/view/account/save       save and encrypt staged account settings
+```
+
+---
+
+## Security Boundary and Threat Model
+
+* **Transport Layer**: AppUser authenticates the client principal to the server; it does not encrypt the 9P wire transport. Only mount `/srv/mailfs` locally or over a secured network channel (such as TLS or a trusted grid network).
+* **Zero-Knowledge Ingress**: `smtpd` uses public-key hybrid encryption (`O9SEAL1`). When an inbound email arrives, it is sealed using the recipient's RSA public key. The daemon has no access to recipient private keys and **cannot read** stored messages after writing them to disk.
+* **At-Rest Vault Encryption**: Mailboxes and account records on disk are encrypted using Monocypher XChaCha20-Poly1305 and Argon2id key derivation. Each user directory (`0700`) contains random opaque `.enc` files (`0600`).
+* **Daemon Restart State**: After a daemon restart, all mailboxes remain locked. Unsealing requires the authenticated client presenting their Factotum credentials. There is no server escrow of user private keys.
+* **Enrollment Gate**: The operator controls `trusted_keys.tab`. Arbitrary self-enrollment is rejected to prevent mailbox impersonation.
+
 ---
 
 ## Building and Compiling
