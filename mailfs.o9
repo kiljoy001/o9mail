@@ -486,6 +486,389 @@ function MailOriginRaw(string envelope) string {
     return out;
 }
 
+function MailLocalDomainRaw() string {
+    string out;
+    c {
+        char buf[256];
+        int fd, n;
+
+        buf[0] = 0;
+        /* 1. Try reading /net/ndb for configured dom= */
+        fd = open("/net/ndb", OREAD);
+        if(fd >= 0){
+            char ndb_data[4096];
+            n = read(fd, ndb_data, sizeof(ndb_data)-1);
+            close(fd);
+            if(n > 0){
+                ndb_data[n] = 0;
+                char *p = strstr(ndb_data, "dom=");
+                if(p != nil){
+                    p += 4;
+                    char *end = p;
+                    while(*end && *end != ' ' && *end != '\t' && *end != '\n' && *end != '\r')
+                        end++;
+                    int len = end - p;
+                    if(len > 0 && len < sizeof(buf)){
+                        memmove(buf, p, len);
+                        buf[len] = 0;
+                    }
+                }
+            }
+        }
+
+        /* 2. Try /dev/sysname */
+        if(buf[0] == 0){
+            fd = open("/dev/sysname", OREAD);
+            if(fd >= 0){
+                n = read(fd, buf, sizeof(buf)-1);
+                close(fd);
+                if(n > 0){
+                    while(n > 0 && (buf[n-1] == '\n' || buf[n-1] == ' ' || buf[n-1] == '\r'))
+                        n--;
+                    buf[n] = 0;
+                }
+            }
+        }
+
+        if(buf[0] != 0){
+            out = o9_string_from_c(buf);
+        } else {
+            out = o9_string_from_c("localhost");
+        }
+    }
+    return out;
+}
+
+function MailAtoiRaw(string s) int64 {
+    int64 out;
+    c {
+        char *cs = o9_string_cstr(s);
+        out = (cs != nil) ? atoi(cs) : 0;
+        if(cs != nil) free(cs);
+    }
+    return out;
+}
+
+function MailDeliverOutboundRaw(string smarthost, int64 port, string localDomain, string sender, string to, string rfc822) string {
+    use { bio ndb }
+    string out;
+    c {
+        char *c_smart, *c_from, *c_to, *c_body, *c_dom;
+        char target_host[256];
+        char addr[320];
+        char reply[1024];
+        char cmd[512];
+        char myhost[256];
+        int fd, code, n, target_port;
+        char *err_msg = nil;
+
+        c_smart = o9_string_cstr(smarthost);
+        c_from = o9_string_cstr(sender);
+        c_to = o9_string_cstr(to);
+        c_body = o9_string_cstr(rfc822);
+        c_dom = o9_string_cstr(localDomain);
+        target_port = (int)port;
+        if(target_port <= 0) target_port = 25;
+
+        if(c_from != nil){
+            char *end = c_from + strlen(c_from) - 1;
+            while(end >= c_from && (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n'))
+                *end-- = 0;
+        }
+        if(c_to != nil){
+            char *end = c_to + strlen(c_to) - 1;
+            while(end >= c_to && (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n'))
+                *end-- = 0;
+        }
+
+        out = nil;
+
+        /* Determine local hostname */
+        if(c_dom != nil && c_dom[0] != 0){
+            strncpy(myhost, c_dom, sizeof(myhost)-1);
+            myhost[sizeof(myhost)-1] = 0;
+        } else {
+            strcpy(myhost, "localhost");
+        }
+
+        /* Determine target host */
+        if(c_smart != nil && c_smart[0] != 0){
+            strncpy(target_host, c_smart, sizeof(target_host)-1);
+            target_host[sizeof(target_host)-1] = 0;
+        } else {
+            char *at = c_to != nil ? strrchr(c_to, '@') : nil;
+            char *dom = (at != nil) ? (at + 1) : c_to;
+            if(dom == nil || dom[0] == 0) dom = "localhost";
+
+            target_host[0] = 0;
+            int dfd = open("/net/dns", ORDWR);
+            if(dfd >= 0){
+                char qbuf[256], rbuf[4096];
+                int best_pref = 999999;
+                snprint(qbuf, sizeof qbuf, "%s mx", dom);
+                seek(dfd, 0, 0);
+                if(write(dfd, qbuf, strlen(qbuf)) == strlen(qbuf)){
+                    seek(dfd, 0, 0);
+                    n = read(dfd, rbuf, sizeof(rbuf)-1);
+                    if(n > 0){
+                        rbuf[n] = 0;
+                        char *p = rbuf;
+                        while(p != nil && *p != 0){
+                            char *eol = strchr(p, '\n');
+                            if(eol != nil) *eol = 0;
+                            char *tab = strchr(p, '\t');
+                            if(tab != nil){
+                                int pref = atoi(tab + 1);
+                                char *sp = strchr(tab + 1, ' ');
+                                while(sp != nil && (*sp == ' ' || *sp == '\t')) sp++;
+                                if(sp != nil && *sp != 0){
+                                    if(pref < best_pref){
+                                        best_pref = pref;
+                                        strncpy(target_host, sp, sizeof(target_host)-1);
+                                        target_host[sizeof(target_host)-1] = 0;
+                                        char *end = target_host + strlen(target_host) - 1;
+                                        while(end >= target_host && (*end == ' ' || *end == '\r' || *end == '\n'))
+                                            *end-- = 0;
+                                    }
+                                }
+                            }
+                            if(eol == nil) break;
+                            p = eol + 1;
+                        }
+                    }
+                }
+                close(dfd);
+            }
+            if(target_host[0] == 0){
+                strncpy(target_host, dom, sizeof(target_host)-1);
+                target_host[sizeof(target_host)-1] = 0;
+            }
+        }
+
+        /* Dial destination MTA */
+        char dir[128];
+        int cfd = -1;
+        snprint(addr, sizeof addr, "tcp!%s!%d", target_host, target_port);
+        fd = dial(addr, nil, dir, &cfd);
+        if(cfd >= 0){
+            char ctlpath[192], ctlcmd[64];
+            snprint(ctlpath, sizeof ctlpath, "%s/ctl", dir);
+            int ctlfd = open(ctlpath, OWRITE);
+            if(ctlfd >= 0){
+                int clen = snprint(ctlcmd, sizeof ctlcmd, "timeout 15000");
+                write(ctlfd, ctlcmd, clen);
+                close(ctlfd);
+            }
+            close(cfd);
+        }
+
+        if(fd < 0){
+            err_msg = smprint("dial %s failed: %r", addr);
+        } else {
+            /* 1. Read greeting */
+            int total = 0, lpos = 0;
+            char line[512];
+            code = 0;
+            for(;;){
+                char c;
+                n = read(fd, &c, 1);
+                if(n <= 0) break;
+                if(total < sizeof(reply) - 1) reply[total++] = c;
+                if(lpos < sizeof(line) - 1) line[lpos++] = c;
+                if(c == '\n'){
+                    line[lpos] = 0;
+                    if(lpos >= 4 && line[3] != '-'){
+                        reply[total] = 0;
+                        code = atoi(line);
+                        break;
+                    }
+                    lpos = 0;
+                }
+            }
+
+            if(code != 220){
+                err_msg = smprint("bad banner from %s: %d", target_host, code);
+            } else {
+                /* 2. Send EHLO */
+                snprint(cmd, sizeof cmd, "EHLO %s\r\n", myhost);
+                write(fd, cmd, strlen(cmd));
+                total = 0; lpos = 0; code = 0;
+                for(;;){
+                    char c;
+                    n = read(fd, &c, 1);
+                    if(n <= 0) break;
+                    if(total < sizeof(reply) - 1) reply[total++] = c;
+                    if(lpos < sizeof(line) - 1) line[lpos++] = c;
+                    if(c == '\n'){
+                        line[lpos] = 0;
+                        if(lpos >= 4 && line[3] != '-'){
+                            reply[total] = 0;
+                            code = atoi(line);
+                            break;
+                        }
+                        lpos = 0;
+                    }
+                }
+                if(code != 250){
+                    snprint(cmd, sizeof cmd, "HELO %s\r\n", myhost);
+                    write(fd, cmd, strlen(cmd));
+                    total = 0; lpos = 0; code = 0;
+                    for(;;){
+                        char c;
+                        n = read(fd, &c, 1);
+                        if(n <= 0) break;
+                        if(total < sizeof(reply) - 1) reply[total++] = c;
+                        if(lpos < sizeof(line) - 1) line[lpos++] = c;
+                        if(c == '\n'){
+                            line[lpos] = 0;
+                            if(lpos >= 4 && line[3] != '-'){
+                                reply[total] = 0;
+                                code = atoi(line);
+                                break;
+                            }
+                            lpos = 0;
+                        }
+                    }
+                }
+
+                if(code != 250){
+                    err_msg = smprint("helo rejected by %s: %d", target_host, code);
+                } else {
+                    /* 3. Send MAIL FROM */
+                    snprint(cmd, sizeof cmd, "MAIL FROM:<%s>\r\n", c_from != nil ? c_from : "");
+                    write(fd, cmd, strlen(cmd));
+                    total = 0; lpos = 0; code = 0;
+                    for(;;){
+                        char c;
+                        n = read(fd, &c, 1);
+                        if(n <= 0) break;
+                        if(total < sizeof(reply) - 1) reply[total++] = c;
+                        if(lpos < sizeof(line) - 1) line[lpos++] = c;
+                        if(c == '\n'){
+                            line[lpos] = 0;
+                            if(lpos >= 4 && line[3] != '-'){
+                                reply[total] = 0;
+                                code = atoi(line);
+                                break;
+                            }
+                            lpos = 0;
+                        }
+                    }
+
+                    if(code != 250){
+                        err_msg = smprint("mail from rejected by %s: %d", target_host, code);
+                    } else {
+                        /* 4. Send RCPT TO */
+                        snprint(cmd, sizeof cmd, "RCPT TO:<%s>\r\n", c_to != nil ? c_to : "");
+                        write(fd, cmd, strlen(cmd));
+                        total = 0; lpos = 0; code = 0;
+                        for(;;){
+                            char c;
+                            n = read(fd, &c, 1);
+                            if(n <= 0) break;
+                            if(total < sizeof(reply) - 1) reply[total++] = c;
+                            if(lpos < sizeof(line) - 1) line[lpos++] = c;
+                            if(c == '\n'){
+                                line[lpos] = 0;
+                                if(lpos >= 4 && line[3] != '-'){
+                                    reply[total] = 0;
+                                    code = atoi(line);
+                                    break;
+                                }
+                                lpos = 0;
+                            }
+                        }
+
+                        if(code != 250 && code != 251){
+                            err_msg = smprint("rcpt to rejected by %s: %d", target_host, code);
+                        } else {
+                            /* 5. Send DATA */
+                            write(fd, "DATA\r\n", 6);
+                            total = 0; lpos = 0; code = 0;
+                            for(;;){
+                                char c;
+                                n = read(fd, &c, 1);
+                                if(n <= 0) break;
+                                if(total < sizeof(reply) - 1) reply[total++] = c;
+                                if(lpos < sizeof(line) - 1) line[lpos++] = c;
+                                if(c == '\n'){
+                                    line[lpos] = 0;
+                                    if(lpos >= 4 && line[3] != '-'){
+                                        reply[total] = 0;
+                                        code = atoi(line);
+                                        break;
+                                    }
+                                    lpos = 0;
+                                }
+                            }
+
+                            if(code != 354){
+                                err_msg = smprint("data rejected by %s: %d", target_host, code);
+                            } else {
+                                /* 6. Send message content with dot stuffing */
+                                char *p = c_body != nil ? c_body : "";
+                                int at_bol = 1;
+                                while(p != nil && *p != 0){
+                                    char *next = strchr(p, '\n');
+                                    int linelen = next != nil ? (next - p) : strlen(p);
+                                    if(at_bol && *p == '.'){
+                                        write(fd, ".", 1);
+                                    }
+                                    int wlen = linelen;
+                                    if(wlen > 0 && p[wlen-1] == '\r') wlen--;
+                                    if(wlen > 0) write(fd, p, wlen);
+                                    write(fd, "\r\n", 2);
+                                    if(next == nil) break;
+                                    p = next + 1;
+                                    at_bol = 1;
+                                }
+                                write(fd, ".\r\n", 3);
+                                total = 0; lpos = 0; code = 0;
+                                for(;;){
+                                    char c;
+                                    n = read(fd, &c, 1);
+                                    if(n <= 0) break;
+                                    if(total < sizeof(reply) - 1) reply[total++] = c;
+                                    if(lpos < sizeof(line) - 1) line[lpos++] = c;
+                                    if(c == '\n'){
+                                        line[lpos] = 0;
+                                        if(lpos >= 4 && line[3] != '-'){
+                                            reply[total] = 0;
+                                            code = atoi(line);
+                                            break;
+                                        }
+                                        lpos = 0;
+                                    }
+                                }
+
+                                if(code != 250){
+                                    err_msg = smprint("message rejected by %s: %d", target_host, code);
+                                } else {
+                                    /* 7. QUIT */
+                                    write(fd, "QUIT\r\n", 6);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            close(fd);
+        }
+
+        if(err_msg != nil){
+            out = o9_string_from_c(err_msg);
+            free(err_msg);
+        }
+
+        if(c_smart != nil) free(c_smart);
+        if(c_from != nil) free(c_from);
+        if(c_to != nil) free(c_to);
+        if(c_body != nil) free(c_body);
+        if(c_dom != nil) free(c_dom);
+    }
+    return out;
+}
+
 class MailDisk {
     method bool privateDir(string path) {
         Task<int64> t = spawn MailPrivateDirRaw(path);
@@ -561,11 +944,29 @@ class MailDisk {
         Task<string> t = spawn MailUnsealO9Seal1Raw(user, blob);
         return t.await();
     }
+
+    method string localDomain() {
+        Task<string> t = spawn MailLocalDomainRaw();
+        return t.await();
+    }
+
+    method string deliver(string smarthost, int64 port, string localDomain, string sender, string to, string rfc822) {
+        Task<string> t = spawn MailDeliverOutboundRaw(smarthost, port, localDomain, sender, to, rfc822);
+        return t.await();
+    }
+
+    method int64 toInt(string s) {
+        Task<int64> t = spawn MailAtoiRaw(s);
+        return t.await();
+    }
 }
 
 class MailView {
     ViewController;
     private string root;
+    private string smarthost;
+    private int64 smtpPort;
+    private string domain;
     private dictionary<string> owners;
     private dictionary<string> selected;
     private dictionary<string> staged;
@@ -576,10 +977,18 @@ class MailView {
     private dictionary<string> accountUser;
     private dictionary<string> accountFolder;
     private dictionary<Vault> vaults;
+    private dictionary<string> outboxTo;
+    private dictionary<string> outboxSubject;
+    private dictionary<string> outboxBody;
+    private dictionary<string> outboxMessage;
+    private dictionary<string> outboxStatus;
     private MailDisk disk;
 
-    method MailView(string privateRoot) {
+    method MailView(string privateRoot, string relayHost, int64 relayPort, string srvDomain) {
         root = privateRoot;
+        smarthost = relayHost;
+        smtpPort = relayPort;
+        domain = srvDomain;
         owners = new dictionary<string>();
         selected = new dictionary<string>();
         staged = new dictionary<string>();
@@ -590,7 +999,15 @@ class MailView {
         accountUser = new dictionary<string>();
         accountFolder = new dictionary<string>();
         vaults = new dictionary<Vault>();
+        outboxTo = new dictionary<string>();
+        outboxSubject = new dictionary<string>();
+        outboxBody = new dictionary<string>();
+        outboxMessage = new dictionary<string>();
+        outboxStatus = new dictionary<string>();
         disk = new MailDisk();
+        if(len(domain) == 0) {
+            domain = disk.localDomain();
+        }
     }
 
     private method string userDir(string principal) {
@@ -740,6 +1157,11 @@ class MailView {
         accountHost.set(id, "");
         accountUser.set(id, "");
         accountFolder.set(id, "");
+        outboxTo.set(id, "");
+        outboxSubject.set(id, "");
+        outboxBody.set(id, "");
+        outboxMessage.set(id, "");
+        outboxStatus.set(id, "idle\n");
         tree.text("principal", caller, false);
         tree.live("status", false);
         tree.live("unlock", true);
@@ -753,6 +1175,13 @@ class MailView {
         tree.live("inbox/source", true);
         tree.live("inbox/commit", true);
         tree.live("inbox/last", false);
+        tree.dir("outbox");
+        tree.live("outbox/to", true);
+        tree.live("outbox/subject", true);
+        tree.live("outbox/body", true);
+        tree.live("outbox/message", true);
+        tree.live("outbox/status", false);
+        tree.live("outbox/send", true);
         tree.dir("account");
         tree.live("account/current.tab", false);
         tree.live("account/protocol", true);
@@ -822,6 +1251,21 @@ class MailView {
             string opened = openEnvelope(id, principal, mid);
             if(opened == nil) { return nil; }
             return disk.origin(opened);
+        }
+        if(cmp(path, "outbox/to") == 0) {
+            return cat(outboxTo.get(id), "\n");
+        }
+        if(cmp(path, "outbox/subject") == 0) {
+            return cat(outboxSubject.get(id), "\n");
+        }
+        if(cmp(path, "outbox/body") == 0) {
+            return cat(outboxBody.get(id), "");
+        }
+        if(cmp(path, "outbox/message") == 0) {
+            return cat(outboxMessage.get(id), "");
+        }
+        if(cmp(path, "outbox/status") == 0) {
+            return cat(outboxStatus.get(id), "");
         }
         return "";
     }
@@ -947,6 +1391,66 @@ class MailView {
             lastImport.set(id, cat("stored ", mid));
             return len(text);
         }
+        if(cmp(path, "outbox/to") == 0) {
+            outboxTo.set(id, text);
+            return len(text);
+        }
+        if(cmp(path, "outbox/subject") == 0) {
+            outboxSubject.set(id, text);
+            return len(text);
+        }
+        if(cmp(path, "outbox/body") == 0) {
+            outboxBody.set(id, text);
+            return len(text);
+        }
+        if(cmp(path, "outbox/message") == 0) {
+            outboxMessage.set(id, text);
+            return len(text);
+        }
+        if(cmp(path, "outbox/send") == 0) {
+            if(!unlocked(id)) {
+                outboxStatus.set(id, "error: mailbox is locked\n");
+                return -1;
+            }
+            string targetTo = outboxTo.get(id);
+            if(len(targetTo) == 0) {
+                outboxStatus.set(id, "error: recipient 'outbox/to' is empty\n");
+                return -1;
+            }
+            string rawMsg = outboxMessage.get(id);
+            if(len(rawMsg) == 0) {
+                string subj = outboxSubject.get(id);
+                string b = outboxBody.get(id);
+                string draftMid = salt();
+                rawMsg = cat("Subject: ", cat(subj, "\n"));
+                rawMsg = cat(rawMsg, cat("From: ", cat(cat(principal, "@"), cat(domain, "\n"))));
+                rawMsg = cat(rawMsg, cat("To: ", cat(targetTo, "\n")));
+                rawMsg = cat(rawMsg, cat("Message-ID: <", cat(cat(draftMid, "@"), cat(domain, ">\n\n"))));
+                rawMsg = cat(rawMsg, cat(b, "\n"));
+            }
+            string senderAddr = cat(cat(principal, "@"), domain);
+            string err = disk.deliver(smarthost, smtpPort, domain, senderAddr, targetTo, rawMsg);
+            if(err != nil && len(err) > 0) {
+                outboxStatus.set(id, cat("error: ", cat(err, "\n")));
+                return -1;
+            }
+            // Save sent message into sender's encrypted vault
+            string sentMid = salt();
+            Vault v = vaults.get(id);
+            string envelope = disk.envelope(cat("smtp:sent:", targetTo), rawMsg);
+            if(envelope != nil && len(envelope) > 0) {
+                string sealed = v.seal(envelope);
+                if(sealed != nil && len(sealed) > 0) {
+                    disk.write(cat(cat(cat(userDir(principal), "/"), sentMid), ".enc"), sealed);
+                }
+            }
+            outboxStatus.set(id, cat("sent ", cat(sentMid, "\n")));
+            outboxTo.set(id, "");
+            outboxSubject.set(id, "");
+            outboxBody.set(id, "");
+            outboxMessage.set(id, "");
+            return len(text);
+        }
         return -1;
     }
 }
@@ -954,13 +1458,23 @@ class MailView {
 main {
     Task<string> rootArg = spawn ProcessArgRaw(2);
     Task<string> keysArg = spawn ProcessArgRaw(3);
+    Task<string> smartArg = spawn ProcessArgRaw(4);
+    Task<string> portArg = spawn ProcessArgRaw(5);
+    Task<string> domArg = spawn ProcessArgRaw(6);
     string privateRoot = rootArg.await();
     string enrollment = keysArg.await();
+    string smarthost = smartArg.await();
+    string portStr = portArg.await();
+    string srvDomain = domArg.await();
     MailDisk disk = new MailDisk();
+    int64 smtpPort = 25;
+    if(len(portStr) > 0) {
+        smtpPort = disk.toInt(portStr);
+    }
     bool privateOk = disk.privateDir(privateRoot);
     if(len(privateRoot) == 0 || len(enrollment) == 0 ||
        !privateOk) {
-        print("usage: mailfs SERVICE PRIVATE_ROOT TRUSTED_KEYS.tab\n");
+        print("usage: mailfs SERVICE PRIVATE_ROOT TRUSTED_KEYS.tab [SMARTHOST] [PORT] [DOMAIN]\n");
     } else {
         AppUserRSAProvider provider = new AppUserRSAProvider("o9mail", "mailfs", 60);
         tabula keys = new tabula(enrollment);
@@ -977,7 +1491,7 @@ main {
         if(count == 0) {
             print("mailfs: no trusted AppUser keys enrolled\n");
         } else {
-            MailView view = new MailView(privateRoot);
+            MailView view = new MailView(privateRoot, smarthost, smtpPort, srvDomain);
             viewController(view);
             serveAppUsers(provider);
         }

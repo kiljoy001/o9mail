@@ -1,0 +1,618 @@
+import "stdlib/process.o9";
+import "stdlib/appuser.o9";
+
+function DnsResolveMxRaw(string domain) string {
+    use { bio ndb }
+    string out;
+    c {
+        char *dom;
+        char best_host[256];
+        char query[256];
+        char buf[4096];
+        int fd, n, best_pref;
+
+        best_host[0] = 0;
+        best_pref = 999999;
+        out = nil;
+        dom = o9_string_cstr(domain);
+        if(dom != nil && dom[0] != 0){
+            fd = open("/net/dns", ORDWR);
+            if(fd >= 0){
+                snprint(query, sizeof query, "%s mx", dom);
+                seek(fd, 0, 0);
+                if(write(fd, query, strlen(query)) == strlen(query)){
+                    seek(fd, 0, 0);
+                    n = read(fd, buf, sizeof(buf)-1);
+                    if(n > 0){
+                        buf[n] = 0;
+                        char *p = buf;
+                        while(p != nil && *p != 0){
+                            char *eol = strchr(p, '\n');
+                            if(eol != nil) *eol = 0;
+                            char *tab = strchr(p, '\t');
+                            if(tab != nil){
+                                int pref = atoi(tab + 1);
+                                char *sp = strchr(tab + 1, ' ');
+                                while(sp != nil && (*sp == ' ' || *sp == '\t')) sp++;
+                                if(sp != nil && *sp != 0){
+                                    if(pref < best_pref){
+                                        best_pref = pref;
+                                        strncpy(best_host, sp, sizeof(best_host)-1);
+                                        best_host[sizeof(best_host)-1] = 0;
+                                        char *end = best_host + strlen(best_host) - 1;
+                                        while(end >= best_host && (*end == ' ' || *end == '\r' || *end == '\n'))
+                                            *end-- = 0;
+                                    }
+                                }
+                            }
+                            if(eol == nil) break;
+                            p = eol + 1;
+                        }
+                    }
+                }
+                close(fd);
+            }
+            if(best_host[0] != 0){
+                out = o9_string_from_c(best_host);
+            } else {
+                /* RFC 5321 fallback: if no MX record, use domain itself */
+                out = o9_string_from_c(dom);
+            }
+            free(dom);
+        }
+    }
+    return out;
+}
+
+function SmtpReadReplyRaw(int64 cfd) string {
+    string out;
+    c {
+        int fd = (int)cfd;
+        int total = 0, n;
+        char buf[1024];
+        char line[512];
+        int lpos = 0;
+
+        out = nil;
+        for(;;){
+            char c;
+            n = read(fd, &c, 1);
+            if(n <= 0)
+                break;
+            if(total < sizeof(buf) - 1)
+                buf[total++] = c;
+            if(lpos < sizeof(line) - 1)
+                line[lpos++] = c;
+            if(c == '\n'){
+                line[lpos] = 0;
+                if(lpos >= 4 && line[3] != '-'){
+                    buf[total] = 0;
+                    out = o9_string_from_c(buf);
+                    break;
+                }
+                lpos = 0;
+            }
+        }
+    }
+    return out;
+}
+
+function SmtpLocalDomainRaw() string {
+    string out;
+    c {
+        char buf[256];
+        int fd, n;
+
+        buf[0] = 0;
+        /* 1. Try reading /net/ndb for configured dom= */
+        fd = open("/net/ndb", OREAD);
+        if(fd >= 0){
+            char ndb_data[4096];
+            n = read(fd, ndb_data, sizeof(ndb_data)-1);
+            close(fd);
+            if(n > 0){
+                ndb_data[n] = 0;
+                char *p = strstr(ndb_data, "dom=");
+                if(p != nil){
+                    p += 4;
+                    char *end = p;
+                    while(*end && *end != ' ' && *end != '\t' && *end != '\n' && *end != '\r')
+                        end++;
+                    int len = end - p;
+                    if(len > 0 && len < sizeof(buf)){
+                        memmove(buf, p, len);
+                        buf[len] = 0;
+                    }
+                }
+            }
+        }
+
+        /* 2. Try /dev/sysname */
+        if(buf[0] == 0){
+            fd = open("/dev/sysname", OREAD);
+            if(fd >= 0){
+                n = read(fd, buf, sizeof(buf)-1);
+                close(fd);
+                if(n > 0){
+                    while(n > 0 && (buf[n-1] == '\n' || buf[n-1] == ' ' || buf[n-1] == '\r'))
+                        n--;
+                    buf[n] = 0;
+                }
+            }
+        }
+
+        if(buf[0] != 0){
+            out = o9_string_from_c(buf);
+        } else {
+            out = o9_string_from_c("localhost");
+        }
+    }
+    return out;
+}
+
+function SmtpDeliverRaw(string smarthost, int64 port, string localDomain, string sender, string to, string rfc822) string {
+    string out;
+    c {
+        char *c_smart, *c_from, *c_to, *c_body, *c_dom;
+        char target_host[256];
+        char addr[320];
+        char reply[1024];
+        char cmd[512];
+        char myhost[256];
+        int fd, code, n, target_port;
+        char *err_msg = nil;
+
+        c_smart = o9_string_cstr(smarthost);
+        c_from = o9_string_cstr(sender);
+        c_to = o9_string_cstr(to);
+        c_body = o9_string_cstr(rfc822);
+        c_dom = o9_string_cstr(localDomain);
+        target_port = (int)port;
+        if(target_port <= 0) target_port = 25;
+
+        if(c_from != nil){
+            char *end = c_from + strlen(c_from) - 1;
+            while(end >= c_from && (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n'))
+                *end-- = 0;
+        }
+        if(c_to != nil){
+            char *end = c_to + strlen(c_to) - 1;
+            while(end >= c_to && (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n'))
+                *end-- = 0;
+        }
+
+        out = nil;
+
+        /* Determine local hostname */
+        if(c_dom != nil && c_dom[0] != 0){
+            strncpy(myhost, c_dom, sizeof(myhost)-1);
+            myhost[sizeof(myhost)-1] = 0;
+        } else {
+            strcpy(myhost, "localhost");
+        }
+
+        /* Determine target host */
+        if(c_smart != nil && c_smart[0] != 0){
+            strncpy(target_host, c_smart, sizeof(target_host)-1);
+            target_host[sizeof(target_host)-1] = 0;
+        } else {
+            /* Extract domain sender recipient */
+            char *at = c_to != nil ? strrchr(c_to, '@') : nil;
+            char *dom = (at != nil) ? (at + 1) : c_to;
+            if(dom == nil || dom[0] == 0) dom = "localhost";
+
+            /* Query MX via /net/dns */
+            target_host[0] = 0;
+            int dfd = open("/net/dns", ORDWR);
+            if(dfd >= 0){
+                char qbuf[256], rbuf[4096];
+                int best_pref = 999999;
+                snprint(qbuf, sizeof qbuf, "%s mx", dom);
+                seek(dfd, 0, 0);
+                if(write(dfd, qbuf, strlen(qbuf)) == strlen(qbuf)){
+                    seek(dfd, 0, 0);
+                    n = read(dfd, rbuf, sizeof(rbuf)-1);
+                    if(n > 0){
+                        rbuf[n] = 0;
+                        char *p = rbuf;
+                        while(p != nil && *p != 0){
+                            char *eol = strchr(p, '\n');
+                            if(eol != nil) *eol = 0;
+                            char *tab = strchr(p, '\t');
+                            if(tab != nil){
+                                int pref = atoi(tab + 1);
+                                char *sp = strchr(tab + 1, ' ');
+                                while(sp != nil && (*sp == ' ' || *sp == '\t')) sp++;
+                                if(sp != nil && *sp != 0){
+                                    if(pref < best_pref){
+                                        best_pref = pref;
+                                        strncpy(target_host, sp, sizeof(target_host)-1);
+                                        target_host[sizeof(target_host)-1] = 0;
+                                        char *end = target_host + strlen(target_host) - 1;
+                                        while(end >= target_host && (*end == ' ' || *end == '\r' || *end == '\n'))
+                                            *end-- = 0;
+                                    }
+                                }
+                            }
+                            if(eol == nil) break;
+                            p = eol + 1;
+                        }
+                    }
+                }
+                close(dfd);
+            }
+            if(target_host[0] == 0){
+                strncpy(target_host, dom, sizeof(target_host)-1);
+                target_host[sizeof(target_host)-1] = 0;
+            }
+        }
+
+        /* Dial destination MTA */
+        char dir[128];
+        int cfd = -1;
+        snprint(addr, sizeof addr, "tcp!%s!%d", target_host, target_port);
+        fd = dial(addr, nil, dir, &cfd);
+        if(cfd >= 0){
+            char ctlpath[192], ctlcmd[64];
+            snprint(ctlpath, sizeof ctlpath, "%s/ctl", dir);
+            int ctlfd = open(ctlpath, OWRITE);
+            if(ctlfd >= 0){
+                int clen = snprint(ctlcmd, sizeof ctlcmd, "timeout 15000");
+                write(ctlfd, ctlcmd, clen);
+                close(ctlfd);
+            }
+            close(cfd);
+        }
+        if(fd < 0){
+            err_msg = smprint("dial %s failed: %r", addr);
+        } else {
+            /* 1. Read greeting */
+            int total = 0, lpos = 0;
+            char line[512];
+            code = 0;
+            for(;;){
+                char c;
+                n = read(fd, &c, 1);
+                if(n <= 0) break;
+                if(total < sizeof(reply) - 1) reply[total++] = c;
+                if(lpos < sizeof(line) - 1) line[lpos++] = c;
+                if(c == '\n'){
+                    line[lpos] = 0;
+                    if(lpos >= 4 && line[3] != '-'){
+                        reply[total] = 0;
+                        code = atoi(line);
+                        break;
+                    }
+                    lpos = 0;
+                }
+            }
+
+            if(code != 220){
+                err_msg = smprint("bad banner sender %s: %d", target_host, code);
+            } else {
+                /* 2. Send EHLO */
+                snprint(cmd, sizeof cmd, "EHLO %s\r\n", myhost);
+                write(fd, cmd, strlen(cmd));
+                total = 0; lpos = 0; code = 0;
+                for(;;){
+                    char c;
+                    n = read(fd, &c, 1);
+                    if(n <= 0) break;
+                    if(total < sizeof(reply) - 1) reply[total++] = c;
+                    if(lpos < sizeof(line) - 1) line[lpos++] = c;
+                    if(c == '\n'){
+                        line[lpos] = 0;
+                        if(lpos >= 4 && line[3] != '-'){
+                            reply[total] = 0;
+                            code = atoi(line);
+                            break;
+                        }
+                        lpos = 0;
+                    }
+                }
+                if(code != 250){
+                    /* Fallback to HELO */
+                    snprint(cmd, sizeof cmd, "HELO %s\r\n", myhost);
+                    write(fd, cmd, strlen(cmd));
+                    total = 0; lpos = 0; code = 0;
+                    for(;;){
+                        char c;
+                        n = read(fd, &c, 1);
+                        if(n <= 0) break;
+                        if(total < sizeof(reply) - 1) reply[total++] = c;
+                        if(lpos < sizeof(line) - 1) line[lpos++] = c;
+                        if(c == '\n'){
+                            line[lpos] = 0;
+                            if(lpos >= 4 && line[3] != '-'){
+                                reply[total] = 0;
+                                code = atoi(line);
+                                break;
+                            }
+                            lpos = 0;
+                        }
+                    }
+                }
+
+                if(code != 250){
+                    err_msg = smprint("helo rejected by %s: %d", target_host, code);
+                } else {
+                    /* 3. Send MAIL FROM */
+                    snprint(cmd, sizeof cmd, "MAIL FROM:<%s>\r\n", c_from != nil ? c_from : "");
+                    write(fd, cmd, strlen(cmd));
+                    total = 0; lpos = 0; code = 0;
+                    for(;;){
+                        char c;
+                        n = read(fd, &c, 1);
+                        if(n <= 0) break;
+                        if(total < sizeof(reply) - 1) reply[total++] = c;
+                        if(lpos < sizeof(line) - 1) line[lpos++] = c;
+                        if(c == '\n'){
+                            line[lpos] = 0;
+                            if(lpos >= 4 && line[3] != '-'){
+                                reply[total] = 0;
+                                code = atoi(line);
+                                break;
+                            }
+                            lpos = 0;
+                        }
+                    }
+
+                    if(code != 250){
+                        err_msg = smprint("mail sender rejected by %s: %d", target_host, code);
+                    } else {
+                        /* 4. Send RCPT TO */
+                        snprint(cmd, sizeof cmd, "RCPT TO:<%s>\r\n", c_to != nil ? c_to : "");
+                        write(fd, cmd, strlen(cmd));
+                        total = 0; lpos = 0; code = 0;
+                        for(;;){
+                            char c;
+                            n = read(fd, &c, 1);
+                            if(n <= 0) break;
+                            if(total < sizeof(reply) - 1) reply[total++] = c;
+                            if(lpos < sizeof(line) - 1) line[lpos++] = c;
+                            if(c == '\n'){
+                                line[lpos] = 0;
+                                if(lpos >= 4 && line[3] != '-'){
+                                    reply[total] = 0;
+                                    code = atoi(line);
+                                    break;
+                                }
+                                lpos = 0;
+                            }
+                        }
+
+                        if(code != 250 && code != 251){
+                            err_msg = smprint("rcpt to rejected by %s: %d", target_host, code);
+                        } else {
+                            /* 5. Send DATA */
+                            write(fd, "DATA\r\n", 6);
+                            total = 0; lpos = 0; code = 0;
+                            for(;;){
+                                char c;
+                                n = read(fd, &c, 1);
+                                if(n <= 0) break;
+                                if(total < sizeof(reply) - 1) reply[total++] = c;
+                                if(lpos < sizeof(line) - 1) line[lpos++] = c;
+                                if(c == '\n'){
+                                    line[lpos] = 0;
+                                    if(lpos >= 4 && line[3] != '-'){
+                                        reply[total] = 0;
+                                        code = atoi(line);
+                                        break;
+                                    }
+                                    lpos = 0;
+                                }
+                            }
+
+                            if(code != 354){
+                                err_msg = smprint("data rejected by %s: %d", target_host, code);
+                            } else {
+                                /* 6. Send message content with dot stuffing */
+                                char *p = c_body != nil ? c_body : "";
+                                int at_bol = 1;
+                                while(p != nil && *p != 0){
+                                    char *next = strchr(p, '\n');
+                                    int linelen = next != nil ? (next - p) : strlen(p);
+                                    if(at_bol && *p == '.'){
+                                        write(fd, ".", 1);
+                                    }
+                                    int wlen = linelen;
+                                    if(wlen > 0 && p[wlen-1] == '\r') wlen--;
+                                    if(wlen > 0) write(fd, p, wlen);
+                                    write(fd, "\r\n", 2);
+                                    if(next == nil) break;
+                                    p = next + 1;
+                                    at_bol = 1;
+                                }
+                                /* End of data */
+                                write(fd, ".\r\n", 3);
+                                total = 0; lpos = 0; code = 0;
+                                for(;;){
+                                    char c;
+                                    n = read(fd, &c, 1);
+                                    if(n <= 0) break;
+                                    if(total < sizeof(reply) - 1) reply[total++] = c;
+                                    if(lpos < sizeof(line) - 1) line[lpos++] = c;
+                                    if(c == '\n'){
+                                        line[lpos] = 0;
+                                        if(lpos >= 4 && line[3] != '-'){
+                                            reply[total] = 0;
+                                            code = atoi(line);
+                                            break;
+                                        }
+                                        lpos = 0;
+                                    }
+                                }
+
+                                if(code != 250){
+                                    err_msg = smprint("message content rejected by %s: %d", target_host, code);
+                                } else {
+                                    /* 7. QUIT */
+                                    write(fd, "QUIT\r\n", 6);
+                                    /* Success! err_msg stays nil */
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            close(fd);
+        }
+
+        if(err_msg != nil){
+            out = o9_string_from_c(err_msg);
+            free(err_msg);
+        }
+
+        if(c_smart != nil) free(c_smart);
+        if(c_from != nil) free(c_from);
+        if(c_to != nil) free(c_to);
+        if(c_body != nil) free(c_body);
+        if(c_dom != nil) free(c_dom);
+    }
+    return out;
+}
+
+function SmtpReadInputRaw(string path) string {
+    string out;
+    c {
+        char *c_path;
+        int fd;
+        char buf[8192];
+        char *accum;
+        int accum_len, accum_cap;
+        int n;
+
+        c_path = o9_string_cstr(path);
+        fd = 0;
+        if(c_path != nil && c_path[0] != 0 && strcmp(c_path, "-") != 0){
+            fd = open(c_path, OREAD);
+        }
+
+        out = nil;
+        if(fd >= 0){
+            accum_cap = 16384;
+            accum_len = 0;
+            accum = malloc(accum_cap);
+            if(accum != nil){
+                while((n = read(fd, buf, sizeof buf)) > 0){
+                    if(accum_len + n >= accum_cap){
+                        accum_cap = (accum_cap + n) * 2;
+                        char *new_accum = malloc(accum_cap);
+                        if(new_accum != nil){
+                            memmove(new_accum, accum, accum_len);
+                            free(accum);
+                            accum = new_accum;
+                        } else {
+                            break;
+                        }
+                    }
+                    memmove(accum + accum_len, buf, n);
+                    accum_len += n;
+                }
+                out = o9_string_new(accum, accum_len);
+                free(accum);
+            }
+            if(fd != 0) close(fd);
+        }
+        if(c_path != nil) free(c_path);
+    }
+    return out;
+}
+
+function SmtpAtoiRaw(string s) int64 {
+    int64 out;
+    c {
+        char *cs = o9_string_cstr(s);
+        out = (cs != nil) ? atoi(cs) : 0;
+        if(cs != nil) free(cs);
+    }
+    return out;
+}
+
+class SmtpOut {
+    method string resolveMx(string domain) {
+        Task<string> t = spawn DnsResolveMxRaw(domain);
+        return t.await();
+    }
+
+    method string localDomain() {
+        Task<string> t = spawn SmtpLocalDomainRaw();
+        return t.await();
+    }
+
+    method string deliver(string smarthost, int64 port, string localDomain, string sender, string to, string rfc822) {
+        Task<string> t = spawn SmtpDeliverRaw(smarthost, port, localDomain, sender, to, rfc822);
+        return t.await();
+    }
+
+    method string readInput(string path) {
+        Task<string> t = spawn SmtpReadInputRaw(path);
+        return t.await();
+    }
+
+    method int64 toInt(string s) {
+        Task<int64> t = spawn SmtpAtoiRaw(s);
+        return t.await();
+    }
+}
+
+main {
+    SmtpOut client = new SmtpOut();
+    Task<int64> argcTask = spawn ProcessArgcRaw();
+    int64 argCount = argcTask.await();
+
+    string smarthost = "";
+    int64 port = 25;
+    string domain = "";
+    string sender = "";
+    string to = "";
+    string msgPath = "-";
+
+    int64 idx = 1;
+    while(idx < argCount) {
+        Task<string> argTask = spawn ProcessArgRaw(idx);
+        string arg = argTask.await();
+        if(cmp(arg, "-s") == 0 && idx + 1 < argCount) {
+            idx = idx + 1;
+            Task<string> sTask = spawn ProcessArgRaw(idx);
+            smarthost = sTask.await();
+        } else if(cmp(arg, "-p") == 0 && idx + 1 < argCount) {
+            idx = idx + 1;
+            Task<string> pTask = spawn ProcessArgRaw(idx);
+            string pStr = pTask.await();
+            port = client.toInt(pStr);
+        } else if(cmp(arg, "-d") == 0 && idx + 1 < argCount) {
+            idx = idx + 1;
+            Task<string> dTask = spawn ProcessArgRaw(idx);
+            domain = dTask.await();
+        } else if(len(sender) == 0) {
+            sender = arg;
+        } else if(len(to) == 0) {
+            to = arg;
+        } else if(len(msgPath) == 0 || cmp(msgPath, "-") == 0) {
+            msgPath = arg;
+        }
+        idx = idx + 1;
+    }
+
+    if(len(domain) == 0) {
+        domain = client.localDomain();
+    }
+
+    if(len(sender) == 0 || len(to) == 0) {
+        print("usage: smtpout [-s smarthost] [-p port] [-d domain] FROM TO [MESSAGE_FILE]\n");
+    } else {
+        string body = client.readInput(msgPath);
+        if(body == nil || len(body) == 0) {
+            print("smtpout: error: empty message body\n");
+        } else {
+            string err = client.deliver(smarthost, port, domain, sender, to, body);
+            if(err != nil && len(err) > 0) {
+                print("smtpout: delivery failed: ", err, "\n");
+            } else {
+                print("smtpout: message delivered successfully to ", to, "\n");
+            }
+        }
+    }
+}
