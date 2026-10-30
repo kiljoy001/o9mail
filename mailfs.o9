@@ -125,6 +125,109 @@ function MailPrivateExistsRaw(string path) bool {
     return found;
 }
 
+// Unseal O9SEAL1 hybrid public-key envelope using the user's factotum RSA private key.
+function MailUnsealO9Seal1Raw(string user, string blob) string {
+    use { auth sec mp }
+    string out;
+    c {
+        int fd;
+        AuthRpc *rpc;
+        char *user_cstr, *spec, *key_hex, *cipher_hex, *mod_hex;
+        char *blob_data;
+        vlong blob_len;
+        uchar encbuf[256];
+        int res, i;
+        mpint *m, *n;
+        O9String *k, *c;
+
+        out = nil;
+        user_cstr = o9_string_cstr(user);
+        blob_data = o9_string_data(blob);
+        blob_len = o9_string_len(blob);
+
+        if(user_cstr != nil && blob_data != nil && blob_len >= 16 &&
+           memcmp(blob_data, "O9SEAL1\n", 8) == 0){
+            char *p1 = memchr(blob_data, '\n', blob_len);
+            if(p1 != nil){
+                char *p2 = memchr(p1 + 1, '\n', blob_len - (p1 + 1 - blob_data));
+                if(p2 != nil){
+                    int key_len = p2 - (p1 + 1);
+                    int cipher_len = blob_len - (p2 + 1 - blob_data);
+                    if(key_len >= 128 && cipher_len >= 40){
+                        key_hex = malloc(key_len + 1);
+                        cipher_hex = malloc(cipher_len + 1);
+                        if(key_hex != nil && cipher_hex != nil){
+                            memmove(key_hex, p1 + 1, key_len);
+                            key_hex[key_len] = 0;
+                            memmove(cipher_hex, p2 + 1, cipher_len);
+                            cipher_hex[cipher_len] = 0;
+                            char *end = strchr(cipher_hex, '\n');
+                            if(end != nil) *end = 0;
+
+                            fd = open("/mnt/factotum/rpc", ORDWR|OCEXEC);
+                            if(fd >= 0){
+                                rpc = auth_allocrpc(fd);
+                                if(rpc != nil){
+                                    spec = smprint("proto=rsa service=appuser app=o9mail role=client");
+                                    if(spec != nil){
+                                        if(auth_rpc(rpc, "start", spec, strlen(spec)) == ARok &&
+                                           auth_rpc(rpc, "read", nil, 0) == ARok){
+                                            char *pubstr = strdup(rpc->arg);
+                                            char *space = pubstr != nil ? strchr(pubstr, ' ') : nil;
+                                            if(space != nil){
+                                                *space = 0;
+                                                mod_hex = pubstr;
+                                                if(auth_rpc(rpc, "write", key_hex, strlen(key_hex)) == ARok &&
+                                                   auth_rpc(rpc, "read", nil, 0) == ARok){
+                                                    char *resp_hex = strdup(rpc->arg);
+                                                    if(resp_hex != nil){
+                                                        m = strtomp(resp_hex, nil, 16, nil);
+                                                        n = strtomp(mod_hex, nil, 16, nil);
+                                                        if(m != nil && n != nil){
+                                                            memset(encbuf, 0, sizeof encbuf);
+                                                            int blen = mptobe(m, encbuf, sizeof encbuf, nil);
+                                                            int unlen = pkcs1unpadbuf(encbuf, blen, n, 2);
+                                                            if(unlen == 32){
+                                                                char symkey_hex[65];
+                                                                for(i = 0; i < 32; i++)
+                                                                    snprint(symkey_hex + 2*i, 3, "%02x", encbuf[blen - unlen + i]);
+                                                                symkey_hex[64] = 0;
+
+                                                                k = o9_string_from_c(symkey_hex);
+                                                                c = o9_string_from_c(cipher_hex);
+                                                                if(k != nil && c != nil){
+                                                                    out = o9_decrypt(k, c);
+                                                                }
+                                                                if(k != nil) o9_string_release(k);
+                                                                if(c != nil) o9_string_release(c);
+                                                            }
+                                                        }
+                                                        if(m != nil) mpfree(m);
+                                                        if(n != nil) mpfree(n);
+                                                        free(resp_hex);
+                                                    }
+                                                }
+                                                free(pubstr);
+                                            }
+                                        }
+                                        free(spec);
+                                    }
+                                    auth_freerpc(rpc);
+                                }
+                                close(fd);
+                            }
+                        }
+                        if(key_hex != nil) free(key_hex);
+                        if(cipher_hex != nil) free(cipher_hex);
+                    }
+                }
+            }
+        }
+        if(user_cstr != nil) free(user_cstr);
+    }
+    return out;
+}
+
 function MailIdsRaw(string path) string {
     string out;
     c {
@@ -453,6 +556,11 @@ class MailDisk {
         Task<string> t = spawn MailOriginRaw(envelope);
         return t.await();
     }
+
+    method string unsealO9Seal1(string user, string blob) {
+        Task<string> t = spawn MailUnsealO9Seal1Raw(user, blob);
+        return t.await();
+    }
 }
 
 class MailView {
@@ -655,6 +763,32 @@ class MailView {
         return tree;
     }
 
+    private method string openEnvelope(string session, string principal, string mid) {
+        if(!unlocked(session) || !disk.hexId(mid)) {
+            return nil;
+        }
+        string encPath = cat(cat(cat(userDir(principal), "/"), mid), ".enc");
+        string blob = disk.read(encPath, 132256);
+        if(blob == nil || len(blob) == 0) {
+            return nil;
+        }
+        Vault v = vaults.get(session);
+        String s = new String(blob);
+        if(s.startsWith("O9SEAL1\n")) {
+            string plain = disk.unsealO9Seal1(principal, blob);
+            if(plain != nil && len(plain) > 0) {
+                // Re-seal with the user's unlocked symmetric Vault for instant future access
+                string resealed = v.seal(plain);
+                if(resealed != nil && len(resealed) > 0) {
+                    disk.write(encPath, resealed);
+                }
+                return plain;
+            }
+            return nil;
+        }
+        return v.open(blob);
+    }
+
     internal method string readText(string id, string path) {
         if(!owners.has(id)) {
             return nil;
@@ -677,19 +811,17 @@ class MailView {
             if(!unlocked(id)) { return nil; }
             string mid = selected.get(id);
             if(!disk.hexId(mid)) { return nil; }
-            string blob = disk.read(cat(cat(cat(userDir(principal), "/"), mid), ".enc"), 132256);
-            if(blob == nil) { return nil; }
-            Vault v = vaults.get(id);
-            return disk.extract(v.open(blob));
+            string opened = openEnvelope(id, principal, mid);
+            if(opened == nil) { return nil; }
+            return disk.extract(opened);
         }
         if(cmp(path, "inbox/origin") == 0) {
             if(!unlocked(id)) { return nil; }
             string mid = selected.get(id);
             if(!disk.hexId(mid)) { return nil; }
-            string blob = disk.read(cat(cat(cat(userDir(principal), "/"), mid), ".enc"), 132256);
-            if(blob == nil) { return nil; }
-            Vault v = vaults.get(id);
-            return disk.origin(v.open(blob));
+            string opened = openEnvelope(id, principal, mid);
+            if(opened == nil) { return nil; }
+            return disk.origin(opened);
         }
         return "";
     }
@@ -706,7 +838,9 @@ class MailView {
         if(offset != 0 && cmp(path, "inbox/append") != 0) { return -1; }
         string principal = owners.get(id);
         if(cmp(path, "unlock") == 0) {
-            if(openMailbox(id, principal, text)) { return len(text); }
+            String input = new String(text);
+            string password = input.trim();
+            if(openMailbox(id, principal, password)) { return len(text); }
             return -1;
         }
         if(cmp(path, "lock") == 0) {
@@ -782,10 +916,7 @@ class MailView {
                 int64 i = 0;
                 string candidate = lines.field("\n", i);
                 while(len(candidate) == 32 && i < 128) {
-                    string oldPath = cat(cat(cat(userDir(principal), "/"), candidate), ".enc");
-                    string oldBlob = disk.read(oldPath, 132256);
-                    if(oldBlob == nil) { return -1; }
-                    string opened = v.open(oldBlob);
+                    string opened = openEnvelope(id, principal, candidate);
                     if(opened == nil) { return -1; }
                     if(disk.sourceMatch(opened, source)) {
                         selected.set(id, candidate);
