@@ -1,0 +1,31 @@
+import "stdlib/process.o9";
+import "stdlib/string.o9";
+import "security.o9";
+
+main {
+    print("=== Testing DKIM, SPF, DMARC in o9 ===\n");
+    string domain = "dev9p.rentonsoftworks.coin";
+    string selector = "2026";
+    string keyPath = "/tmp/dkim_dev9p.rentonsoftworks.coin.key";
+    string raw = "From: alice@dev9p.rentonsoftworks.coin\r\nTo: alice@dev9p.rentonsoftworks.coin\r\nSubject: Test Security\r\n\r\nHello World\r\n";
+
+    print("1. Signing message with DKIM...\n");
+    Task<string> signTask = spawn DkimSignMessage(domain, selector, keyPath, raw);
+    string signedMsg = signTask.await();
+    print("Signed message:\n", signedMsg, "\n");
+
+    print("2. Verifying DKIM signature...\n");
+    Task<string> verTask = spawn DkimVerifyMessage(signedMsg);
+    string report = verTask.await();
+    print("Verification report:\n", report, "\n");
+
+    print("3. Verifying SPF for 127.0.0.1...\n");
+    Task<string> spfTask = spawn SpfVerifyClient("127.0.0.1", domain);
+    string spfRes = spfTask.await();
+    print("SPF result: ", spfRes, "\n");
+
+    print("4. Evaluating DMARC policy...\n");
+    Task<string> dmarcTask = spawn DmarcEvaluatePolicy(domain, domain, spfRes, domain, "pass");
+    string dmarcReport = dmarcTask.await();
+    print("DMARC report:\n", dmarcReport, "\n");
+}

@@ -1,6 +1,7 @@
 import "stdlib/process.o9";
 import "stdlib/string.o9";
 import "stdlib/net.o9";
+import "security.o9";
 
 // Low-level network, crypto, and filesystem primitives for RFC 5321 SMTP server
 // with zero-knowledge hybrid public-key sealing.
@@ -49,6 +50,39 @@ function SmtpAcceptRaw(string token) int64 {
                 }
             }
             free(tok);
+        }
+    }
+    return out;
+}
+
+function SmtpRemoteIpRaw(int64 fd) string {
+    string out;
+    c {
+        char path[128];
+        char rem[128];
+        out = o9_string_new("127.0.0.1", 9);
+        if(fd >= 0){
+            if(fd2path((int)fd, path, sizeof path) == 0){
+                char *slash = strrchr(path, '/');
+                if(slash != nil){
+                    *slash = 0;
+                    char rpath[140];
+                    snprint(rpath, sizeof rpath, "%s/remote", path);
+                    int rfd = open(rpath, OREAD);
+                    if(rfd >= 0){
+                        int n = read(rfd, rem, sizeof(rem) - 1);
+                        close(rfd);
+                        if(n > 0){
+                            rem[n] = 0;
+                            char *bang = strchr(rem, '!');
+                            if(bang != nil) *bang = 0;
+                            while(n > 0 && (rem[n-1] == '\n' || rem[n-1] == '\r' || rem[n-1] == ' '))
+                                rem[--n] = 0;
+                            out = o9_string_from_c(rem);
+                        }
+                    }
+                }
+            }
         }
     }
     return out;
@@ -303,6 +337,7 @@ function SmtpSpoolWriteRaw(string spoolDir, string mid, string sender, string rc
 
 class SmtpSession {
     private int64 fd;
+    private string clientIp;
     private string domain;
     private string keysPath;
     private string mailRoot;
@@ -310,10 +345,13 @@ class SmtpSession {
     private int64 sessionState;
     private string heloName;
     private string sender;
+    private string senderDomain;
+    private string spfResult;
     private string recipient;
 
-    method SmtpSession(int64 connFd, string srvDomain, string trustedKeys, string mailBoxRoot, string spool) {
+    method SmtpSession(int64 connFd, string cip, string srvDomain, string trustedKeys, string mailBoxRoot, string spool) {
         fd = connFd;
+        clientIp = cip;
         domain = srvDomain;
         keysPath = trustedKeys;
         mailRoot = mailBoxRoot;
@@ -321,6 +359,8 @@ class SmtpSession {
         sessionState = 0; // 0 = GREET, 1 = READY, 2 = MAIL, 3 = RCPT
         heloName = "";
         sender = "";
+        senderDomain = "";
+        spfResult = "none";
         recipient = "";
     }
 
@@ -356,6 +396,30 @@ class SmtpSession {
             return s.slice(0, atPos);
         }
         return address;
+    }
+
+    private method string extractDomain(string address) {
+        String s = new String(address);
+        int64 atPos = s.indexOf("@");
+        if(atPos >= 0) {
+            return s.slice(atPos + 1, s.length() - atPos - 1);
+        }
+        return "";
+    }
+
+    private method string extractFromDomain(string rfc822) {
+        String s = new String(rfc822);
+        int64 idx = s.indexOf("From:");
+        if(idx < 0) {
+            idx = s.indexOf("from:");
+        }
+        if(idx < 0) {
+            return "";
+        }
+        String after = new String(s.slice(idx + 5, s.length() - idx - 5));
+        string line = after.before("\n");
+        string addr = extractAddress(line);
+        return extractDomain(addr);
     }
 
     private method bool validateRecipient(string address) {
@@ -456,8 +520,8 @@ class SmtpSession {
                 if(s.startsWith(".")) {
                     line = s.slice(1, s.length() - 1);
                 }
-                if(len(body) + len(line) + 1 <= maxBytes) {
-                    body = cat(body, cat(line, "\n"));
+                if(len(body) + len(line) + 2 <= maxBytes) {
+                    body = cat(body, cat(line, "\r\n"));
                 } else {
                     overflow = true;
                 }
@@ -467,6 +531,69 @@ class SmtpSession {
         if(overflow) {
             write("552 5.3.4 Error: message size exceeds 64 KiB limit");
         } else {
+            // 1. Verify DKIM
+            Task<string> dkimTask = spawn DkimVerifyMessage(body);
+            string dkimReport = dkimTask.await();
+            string dkimRes = "none";
+            string dkimDom = "";
+            string dkimSel = "";
+            string dkimReason = "";
+            if(dkimReport != nil && len(dkimReport) > 0) {
+                String dr = new String(dkimReport);
+                dkimRes = dr.line(0);
+                dkimDom = dr.line(1);
+                dkimSel = dr.line(2);
+                dkimReason = dr.line(3);
+                if(len(dkimRes) == 0) {
+                    dkimRes = "none";
+                }
+            }
+            print("smtpd: dkim result: ", dkimRes, " domain: ", dkimDom, " selector: ", dkimSel, " reason: ", dkimReason, "\n");
+
+            // 2. Evaluate DMARC
+            string fromDomain = extractFromDomain(body);
+            if(len(fromDomain) == 0) {
+                fromDomain = senderDomain;
+            }
+            Task<string> dmarcTask = spawn DmarcEvaluatePolicy(fromDomain, senderDomain, spfResult, dkimDom, dkimRes);
+            string dmarcReport = dmarcTask.await();
+            string dmarcRes = "none";
+            string dmarcPol = "none";
+            string dmarcAct = "accept";
+            if(dmarcReport != nil && len(dmarcReport) > 0) {
+                String dmr = new String(dmarcReport);
+                dmarcRes = dmr.line(0);
+                dmarcPol = dmr.line(1);
+                dmarcAct = dmr.line(2);
+                if(len(dmarcRes) == 0) {
+                    dmarcRes = "none";
+                }
+                if(len(dmarcPol) == 0) {
+                    dmarcPol = "none";
+                }
+                if(len(dmarcAct) == 0) {
+                    dmarcAct = "accept";
+                }
+            }
+            print("smtpd: dmarc result: ", dmarcRes, " policy: ", dmarcPol, " action: ", dmarcAct, "\n");
+
+            // 3. Enforce DMARC reject policy
+            if(cmp(dmarcAct, "reject") == 0) {
+                print("smtpd: message REJECTED by DMARC policy for domain ", fromDomain, "\n");
+                write(cat("550 5.7.1 DMARC policy violation for ", fromDomain));
+                sessionState = 1;
+                sender = "";
+                recipient = "";
+                return true;
+            }
+
+            // 4. Prepend RFC 8601 Authentication-Results header
+            Task<string> authTask = spawn FormatAuthResultsHeader(domain, clientIp, sender, spfResult, dkimRes, dkimDom, dkimSel, dmarcRes, dmarcPol, dmarcAct, fromDomain);
+            string authHeader = authTask.await();
+            if(authHeader != nil && len(authHeader) > 0) {
+                body = cat(authHeader, body);
+            }
+
             string mid = salt();
             string localPart = extractLocalPart(recipient);
             bool delivered = false;
@@ -554,6 +681,16 @@ class SmtpSession {
             sender = from;
             recipient = "";
             sessionState = 2; // MAIL state
+
+            senderDomain = extractDomain(sender);
+            if(len(senderDomain) > 0) {
+                Task<string> spfTask = spawn SpfVerifyClient(clientIp, senderDomain);
+                spfResult = spfTask.await();
+            } else {
+                spfResult = "none";
+            }
+            print("smtpd: spf for client ", clientIp, " sender <", sender, ">: ", spfResult, "\n");
+
             write(cat("250 2.1.0 Sender <", cat(sender, "> OK")));
             return true;
         }
@@ -640,8 +777,14 @@ main {
     if(len(address) == 0) {
         address = "tcp!*!2525";
     }
-    if(len(domain) == 0) {
-        domain = "localhost";
+    if(len(domain) == 0 || cmp(domain, "localhost") == 0) {
+        Task<string> dTask = spawn SmtpLocalDomainRaw();
+        string detected = dTask.await();
+        if(detected != nil && len(detected) > 0) {
+            domain = detected;
+        } else {
+            domain = "localhost";
+        }
     }
     if(len(mailRoot) == 0) {
         mailRoot = "/mail/o9mail";
@@ -673,8 +816,10 @@ main {
                 print("smtpd: accept failed or interrupted\n");
                 running = false;
             } else {
-                print("smtpd: accepted connection fd=", connFd, "\n");
-                SmtpSession session = new SmtpSession(connFd, domain, keysPath, mailRoot, spoolDir);
+                Task<string> ipTask = spawn SmtpRemoteIpRaw(connFd);
+                string clientIp = ipTask.await();
+                print("smtpd: accepted connection fd=", connFd, " from ", clientIp, "\n");
+                SmtpSession session = new SmtpSession(connFd, clientIp, domain, keysPath, mailRoot, spoolDir);
                 session.run();
                 print("smtpd: session closed fd=", connFd, "\n");
             }

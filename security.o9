@@ -1,0 +1,927 @@
+import "stdlib/process.o9";
+import "stdlib/string.o9";
+
+// ====================================================================
+// o9mail Security Suite: DKIM (RFC 6376), SPF (RFC 7208), DMARC (RFC 7489)
+// ====================================================================
+
+function DkimSignMessage(string domain, string selector, string keyPath, string rfc822) string {
+    use { sec mp }
+    string out;
+    c {
+        static uchar sha256_prefix[] = {
+            0x30,0x31,0x30,0x0d,0x06,0x09,0x60,0x86,0x48,0x01,
+            0x65,0x03,0x04,0x02,0x01,0x05,0x00,0x04,0x20
+        };
+
+        char *dom = o9_string_cstr(domain);
+        char *sel = o9_string_cstr(selector);
+        char *kpath = o9_string_cstr(keyPath);
+        char *c_msg = o9_string_cstr(rfc822);
+        RSApriv *priv = nil;
+        char *signed_res = nil;
+
+        out = nil;
+        if(dom == nil || sel == nil || kpath == nil || c_msg == nil)
+            goto dkim_sign_finish;
+
+        /* 1. Read RSA Private Key */
+        int fd = open(kpath, OREAD);
+        if(fd < 0) goto dkim_sign_finish;
+        char kbuf[4096];
+        int kn = read(fd, kbuf, sizeof(kbuf)-1);
+        close(fd);
+        if(kn <= 0) goto dkim_sign_finish;
+        kbuf[kn] = 0;
+
+        char *fields[32];
+        int nf = tokenize(kbuf, fields, 32);
+        char *ek = nil, *dk = nil, *n_hex = nil, *p = nil, *q = nil, *kp = nil, *kq = nil, *c2 = nil;
+        for(int i = 0; i < nf; i++){
+            if(strncmp(fields[i], "ek=", 3) == 0) ek = fields[i] + 3;
+            else if(strncmp(fields[i], "!dk=", 4) == 0) dk = fields[i] + 4;
+            else if(strncmp(fields[i], "n=", 2) == 0) n_hex = fields[i] + 2;
+            else if(strncmp(fields[i], "!p=", 3) == 0) p = fields[i] + 3;
+            else if(strncmp(fields[i], "!q=", 3) == 0) q = fields[i] + 3;
+            else if(strncmp(fields[i], "!kp=", 4) == 0) kp = fields[i] + 4;
+            else if(strncmp(fields[i], "!kq=", 4) == 0) kq = fields[i] + 4;
+            else if(strncmp(fields[i], "!c2=", 4) == 0) c2 = fields[i] + 4;
+        }
+        if(n_hex == nil || ek == nil || dk == nil || p == nil || q == nil)
+            goto dkim_sign_finish;
+
+        priv = rsaprivalloc();
+        priv->pub.ek = strtomp(ek, nil, 16, nil);
+        priv->pub.n  = strtomp(n_hex, nil, 16, nil);
+        priv->dk     = strtomp(dk, nil, 16, nil);
+        priv->p      = strtomp(p, nil, 16, nil);
+        priv->q      = strtomp(q, nil, 16, nil);
+        if(kp != nil) priv->kp = strtomp(kp, nil, 16, nil);
+        if(kq != nil) priv->kq = strtomp(kq, nil, 16, nil);
+        if(c2 != nil) priv->c2 = strtomp(c2, nil, 16, nil);
+
+        /* 2. Separate Headers and Body */
+        char *body = strstr(c_msg, "\r\n\r\n");
+        int hlen = 0;
+        if(body != nil){
+            hlen = body - c_msg;
+            body += 4;
+        } else {
+            body = strstr(c_msg, "\n\n");
+            if(body != nil){
+                hlen = body - c_msg;
+                body += 2;
+            } else {
+                body = "";
+                hlen = strlen(c_msg);
+            }
+        }
+        char *hdrs = malloc(hlen + 1);
+        memmove(hdrs, c_msg, hlen);
+        hdrs[hlen] = 0;
+
+        /* 3. Canonicalize Body (relaxed) & Compute Body Hash (bh=) */
+        int blen = strlen(body);
+        char *cbody = malloc(blen + 4);
+        int opos = 0;
+        char *bp = body;
+        while(*bp != 0){
+            char *eol = strchr(bp, '\n');
+            int lsize = (eol != nil) ? (eol - bp) : strlen(bp);
+            int in_sp = 0;
+            int lstart = opos;
+            for(int i = 0; i < lsize; i++){
+                char c = bp[i];
+                if(c == '\r') continue;
+                if(c == ' ' || c == '\t'){
+                    if(!in_sp){ cbody[opos++] = ' '; in_sp = 1; }
+                } else {
+                    cbody[opos++] = c; in_sp = 0;
+                }
+            }
+            while(opos > lstart && cbody[opos-1] == ' ') opos--;
+            cbody[opos++] = '\r';
+            cbody[opos++] = '\n';
+            if(eol == nil) break;
+            bp = eol + 1;
+        }
+        while(opos >= 4 && cbody[opos-4] == '\r' && cbody[opos-3] == '\n' && cbody[opos-2] == '\r' && cbody[opos-1] == '\n'){
+            opos -= 2;
+        }
+        if(opos == 2 && cbody[0] == '\r' && cbody[1] == '\n')
+            opos = 0;
+        cbody[opos] = 0;
+
+        uchar b_digest[SHA2_256dlen];
+        sha2_256((uchar*)cbody, opos, b_digest, nil);
+        free(cbody);
+
+        char bh_b64[128];
+        int bh_len = enc64(bh_b64, sizeof bh_b64, b_digest, sizeof b_digest);
+        bh_b64[bh_len] = 0;
+
+        /* 4. Canonicalize Headers in standard order */
+        char *h_order[] = { "from", "to", "subject", "date", "message-id", nil };
+        char to_sign[8192];
+        to_sign[0] = 0;
+        char h_list[256];
+        h_list[0] = 0;
+
+        for(int i = 0; h_order[i] != nil; i++){
+            int nlen = strlen(h_order[i]);
+            char *hp = hdrs;
+            while(hp != nil && *hp != 0){
+                if(cistrncmp(hp, h_order[i], nlen) == 0 && (hp[nlen] == ':' || hp[nlen] == ' ')){
+                    char *colon = strchr(hp, ':');
+                    if(colon != nil){
+                        char *eol = strstr(colon, "\r\n");
+                        if(eol == nil) eol = strchr(colon, '\n');
+                        char *val = colon + 1;
+                        while(*val == ' ' || *val == '\t') val++;
+                        int vlen = (eol != nil) ? (eol - val) : strlen(val);
+
+                        char *cleanval = malloc(vlen + 1);
+                        int cj = 0, in_sp = 0;
+                        for(int k = 0; k < vlen; k++){
+                            char c = val[k];
+                            if(c == '\r' || c == '\n') continue;
+                            if(c == ' ' || c == '\t'){
+                                if(!in_sp){ cleanval[cj++] = ' '; in_sp = 1; }
+                            } else {
+                                cleanval[cj++] = c; in_sp = 0;
+                            }
+                        }
+                        while(cj > 0 && cleanval[cj-1] == ' ') cj--;
+                        cleanval[cj] = 0;
+
+                        char *chdr = smprint("%s:%s\r\n", h_order[i], cleanval);
+                        strcat(to_sign, chdr);
+                        free(chdr);
+                        free(cleanval);
+
+                        if(h_list[0] != 0) strcat(h_list, ":");
+                        strcat(h_list, h_order[i]);
+                        break;
+                    }
+                }
+                char *next = strstr(hp, "\r\n");
+                if(next != nil) hp = next + 2;
+                else {
+                    next = strchr(hp, '\n');
+                    if(next != nil) hp = next + 1;
+                    else break;
+                }
+            }
+        }
+        free(hdrs);
+
+        /* 5. Append DKIM-Signature header template up to b= */
+        char dkim_tmpl[1024];
+        snprint(dkim_tmpl, sizeof dkim_tmpl,
+            "dkim-signature:v=1; a=rsa-sha256; c=relaxed/relaxed; d=%s; s=%s; h=%s; bh=%s; b=",
+            dom, sel, h_list, bh_b64);
+        strcat(to_sign, dkim_tmpl);
+
+        /* 6. Compute SHA256 of canonicalized headers */
+        uchar h_digest[SHA2_256dlen];
+        sha2_256((uchar*)to_sign, strlen(to_sign), h_digest, nil);
+
+        /* 7. PKCS #1 v1.5 RSA Signing */
+        int k = (mpsignif(priv->pub.n) + 7) / 8;
+        uchar *block = malloc(k);
+        block[0] = 0x00;
+        block[1] = 0x01;
+        int padlen = k - 3 - sizeof(sha256_prefix) - sizeof(h_digest);
+        memset(block + 2, 0xFF, padlen);
+        block[2 + padlen] = 0x00;
+        memmove(block + 2 + padlen + 1, sha256_prefix, sizeof(sha256_prefix));
+        memmove(block + k - sizeof(h_digest), h_digest, sizeof(h_digest));
+
+        mpint *in = betomp(block, k, nil);
+        mpint *sig = rsadecrypt(priv, in, nil);
+        uchar *sigbytes = malloc(k);
+        memset(sigbytes, 0, k);
+        int slen = (mpsignif(sig) + 7) / 8;
+        mptobe(sig, sigbytes + k - slen, slen, nil);
+
+        char *b64sig = malloc(k * 2 + 64);
+        int b64len = enc64(b64sig, k * 2 + 64, sigbytes, k);
+        b64sig[b64len] = 0;
+
+        char *dkim_header = smprint(
+            "DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=%s; s=%s;\r\n"
+            " h=%s;\r\n"
+            " bh=%s;\r\n"
+            " b=%s\r\n",
+            dom, sel, h_list, bh_b64, b64sig);
+
+        signed_res = smprint("%s%s", dkim_header, c_msg);
+
+        free(block);
+        free(sigbytes);
+        free(b64sig);
+        free(dkim_header);
+        mpfree(in);
+        mpfree(sig);
+
+    dkim_sign_finish:
+        if(priv != nil) rsaprivfree(priv);
+        if(dom != nil) free(dom);
+        if(sel != nil) free(sel);
+        if(kpath != nil) free(kpath);
+        if(c_msg != nil) free(c_msg);
+
+        if(signed_res != nil){
+            out = o9_string_from_c(signed_res);
+            free(signed_res);
+        }
+    }
+    return out;
+}
+
+function DkimVerifyMessage(string rfc822) string {
+    use { sec mp }
+    string out;
+    c {
+        static uchar sha256_prefix[] = {
+            0x30,0x31,0x30,0x0d,0x06,0x09,0x60,0x86,0x48,0x01,
+            0x65,0x03,0x04,0x02,0x01,0x05,0x00,0x04,0x20
+        };
+
+        char *c_msg = o9_string_cstr(rfc822);
+        char *report = nil;
+        RSApub *pub = nil;
+
+        out = nil;
+        if(c_msg == nil) goto dkim_ver_finish;
+
+        /* 1. Find DKIM-Signature header */
+        char *sig_hdr = strstr(c_msg, "DKIM-Signature:");
+        if(sig_hdr == nil) sig_hdr = strstr(c_msg, "dkim-signature:");
+        if(sig_hdr == nil){
+            report = smprint("none\n\n\nno DKIM-Signature header found");
+            goto dkim_ver_finish;
+        }
+
+        char *hdr_end = strstr(sig_hdr, "\r\n\r\n");
+        if(hdr_end == nil) hdr_end = strstr(sig_hdr, "\n\n");
+        if(hdr_end == nil) hdr_end = sig_hdr + strlen(sig_hdr);
+
+        char *body = strstr(c_msg, "\r\n\r\n");
+        if(body != nil) body += 4;
+        else {
+            body = strstr(c_msg, "\n\n");
+            if(body != nil) body += 2;
+            else body = "";
+        }
+
+        /* 2. Unfold and parse tags: d=, s=, h=, bh=, b= */
+        char domain[128] = {0}, selector[64] = {0}, h_list[256] = {0}, bh_val[128] = {0};
+        char b64sig[1024] = {0};
+
+        char *hp = sig_hdr;
+        char dkim_raw[2048] = {0};
+        int dlen = 0;
+        while(hp < hdr_end){
+            char *next = strstr(hp, "\r\n");
+            int skip = 2;
+            if(next == nil){
+                next = strchr(hp, '\n');
+                skip = 1;
+            }
+            int l = (next != nil) ? (next - hp) : (hdr_end - hp);
+            if(dlen > 0 && !(hp[0] == ' ' || hp[0] == '\t')) break;
+            for(int i = 0; i < l; i++){
+                if(hp[i] != '\r' && hp[i] != '\n' && dlen < sizeof(dkim_raw)-1)
+                    dkim_raw[dlen++] = hp[i];
+            }
+            if(next == nil) break;
+            hp = next + skip;
+        }
+        dkim_raw[dlen] = 0;
+
+        char *tag = dkim_raw;
+        while(tag != nil && *tag != 0){
+            while(*tag == ' ' || *tag == '\t' || *tag == ';') tag++;
+            if(strncmp(tag, "d=", 2) == 0){
+                tag += 2;
+                int i = 0;
+                while(*tag && *tag != ';' && *tag != ' ' && i < sizeof(domain)-1) domain[i++] = *tag++;
+                domain[i] = 0;
+            } else if(strncmp(tag, "s=", 2) == 0){
+                tag += 2;
+                int i = 0;
+                while(*tag && *tag != ';' && *tag != ' ' && i < sizeof(selector)-1) selector[i++] = *tag++;
+                selector[i] = 0;
+            } else if(strncmp(tag, "h=", 2) == 0){
+                tag += 2;
+                int i = 0;
+                while(*tag && *tag != ';' && *tag != ' ' && i < sizeof(h_list)-1) h_list[i++] = *tag++;
+                h_list[i] = 0;
+            } else if(strncmp(tag, "bh=", 3) == 0){
+                tag += 3;
+                int i = 0;
+                while(*tag && *tag != ';' && *tag != ' ' && i < sizeof(bh_val)-1) bh_val[i++] = *tag++;
+                bh_val[i] = 0;
+            } else if(strncmp(tag, "b=", 2) == 0){
+                tag += 2;
+                int i = 0;
+                while(*tag && *tag != ';' && *tag != ' ' && i < sizeof(b64sig)-1) b64sig[i++] = *tag++;
+                b64sig[i] = 0;
+            } else {
+                tag = strpbrk(tag, ";");
+                if(tag != nil) tag++;
+            }
+        }
+
+        if(domain[0] == 0 || selector[0] == 0 || bh_val[0] == 0 || b64sig[0] == 0){
+            report = smprint("fail\n%s\n%s\nincomplete DKIM tags: raw='%s'",
+                domain, selector, dkim_raw);
+            goto dkim_ver_finish;
+        }
+
+        /* 3. Verify Body Hash */
+        int blen = strlen(body);
+        char *cbody = malloc(blen + 4);
+        int opos = 0;
+        char *bp = body;
+        while(*bp != 0){
+            char *eol = strchr(bp, '\n');
+            int lsize = (eol != nil) ? (eol - bp) : strlen(bp);
+            int in_sp = 0;
+            int lstart = opos;
+            for(int i = 0; i < lsize; i++){
+                char c = bp[i];
+                if(c == '\r') continue;
+                if(c == ' ' || c == '\t'){
+                    if(!in_sp){ cbody[opos++] = ' '; in_sp = 1; }
+                } else {
+                    cbody[opos++] = c; in_sp = 0;
+                }
+            }
+            while(opos > lstart && cbody[opos-1] == ' ') opos--;
+            cbody[opos++] = '\r';
+            cbody[opos++] = '\n';
+            if(eol == nil) break;
+            bp = eol + 1;
+        }
+        while(opos >= 4 && cbody[opos-4] == '\r' && cbody[opos-3] == '\n' && cbody[opos-2] == '\r' && cbody[opos-1] == '\n'){
+            opos -= 2;
+        }
+        if(opos == 2 && cbody[0] == '\r' && cbody[1] == '\n')
+            opos = 0;
+        cbody[opos] = 0;
+
+        uchar b_digest[SHA2_256dlen];
+        sha2_256((uchar*)cbody, opos, b_digest, nil);
+        free(cbody);
+
+        char calc_bh[128];
+        int cbhlen = enc64(calc_bh, sizeof calc_bh, b_digest, sizeof b_digest);
+        calc_bh[cbhlen] = 0;
+
+        if(strcmp(calc_bh, bh_val) != 0){
+            report = smprint("fail\n%s\n%s\nbody hash mismatch (bh)", domain, selector);
+            goto dkim_ver_finish;
+        }
+
+        /* 4. Query Public Key from DNS: <selector>._domainkey.<domain> txt */
+        char qname[256];
+        snprint(qname, sizeof qname, "%s._domainkey.%s txt", selector, domain);
+        int dfd = open("/net/dns", ORDWR);
+        char dnsbuf[8192];
+        int dtot = 0;
+        if(dfd >= 0){
+            seek(dfd, 0, 0);
+            write(dfd, qname, strlen(qname));
+            seek(dfd, 0, 0);
+            int dn;
+            while(dtot < sizeof(dnsbuf) - 1){
+                dn = read(dfd, dnsbuf + dtot, sizeof(dnsbuf) - 1 - dtot);
+                if(dn <= 0) break;
+                dtot += dn;
+            }
+            close(dfd);
+        }
+        dnsbuf[dtot] = 0;
+
+        char *pk_b64 = nil;
+        char *p_tag = strstr(dnsbuf, "p=");
+        if(p_tag != nil){
+            p_tag += 2;
+            char *p_end = p_tag;
+            while(*p_end && *p_end != ';' && *p_end != ' ' && *p_end != '\t' && *p_end != '\r' && *p_end != '\n')
+                p_end++;
+            int pklen = p_end - p_tag;
+            pk_b64 = malloc(pklen + 1);
+            memmove(pk_b64, p_tag, pklen);
+            pk_b64[pklen] = 0;
+        }
+
+        /* Fallback: if not in public DNS, check local keyfile */
+        if(pk_b64 == nil || pk_b64[0] == 0){
+            char localkey[128];
+            snprint(localkey, sizeof localkey, "/tmp/dkim_%s.key", domain);
+            int lfd = open(localkey, OREAD);
+            if(lfd < 0) snprint(localkey, sizeof localkey, "/mail/o9mail/dkim_%s.key", domain);
+            else close(lfd);
+            lfd = open(localkey, OREAD);
+            if(lfd >= 0){
+                char lbuf[4096];
+                int ln = read(lfd, lbuf, sizeof(lbuf)-1);
+                close(lfd);
+                if(ln > 0){
+                    lbuf[ln] = 0;
+                    char *fields[32];
+                    int nf = tokenize(lbuf, fields, 32);
+                    char *ek = nil, *n_hex = nil;
+                    for(int i = 0; i < nf; i++){
+                        if(strncmp(fields[i], "ek=", 3) == 0) ek = fields[i] + 3;
+                        else if(strncmp(fields[i], "n=", 2) == 0) n_hex = fields[i] + 2;
+                    }
+                    if(ek != nil && n_hex != nil){
+                        pub = rsapuballoc();
+                        pub->ek = strtomp(ek, nil, 16, nil);
+                        pub->n  = strtomp(n_hex, nil, 16, nil);
+                    }
+                }
+            }
+        } else {
+            uchar der[2048];
+            int dlen = dec64(der, sizeof der, pk_b64, strlen(pk_b64));
+            if(dlen > 0){
+                /* SubjectPublicKeyInfo to RSApub */
+                for(int i = 0; i < dlen - 4; i++){
+                    if(der[i] == 0x03){
+                        int bl = 0;
+                        int off = i + 1;
+                        if(der[off] & 0x80){
+                            int nb = der[off] & 0x7F;
+                            off++;
+                            for(int j = 0; j < nb; j++) bl = (bl << 8) | der[off++];
+                        } else {
+                            bl = der[off++];
+                        }
+                        if(off < dlen && der[off] == 0x00){
+                            off++; bl--;
+                            if(off + bl <= dlen){
+                                pub = asn1toRSApub(der + off, bl);
+                                if(pub != nil) break;
+                            }
+                        }
+                    }
+                }
+                if(pub == nil) pub = asn1toRSApub(der, dlen);
+            }
+            free(pk_b64);
+        }
+
+        if(pub == nil){
+            report = smprint("fail\n%s\n%s\npublic key not found or unparseable", domain, selector);
+            goto dkim_ver_finish;
+        }
+
+        /* 5. Reconstruct canonicalized headers listed in h= */
+        char to_verify[8192];
+        to_verify[0] = 0;
+        char *h_tok = strdup(h_list);
+        char *h_p = h_tok;
+        while(h_p != nil && *h_p != 0){
+            char *next = strchr(h_p, ':');
+            if(next != nil) *next = 0;
+            int nlen = strlen(h_p);
+            char *chp = c_msg;
+            while(chp != nil && *chp != 0){
+                if(cistrncmp(chp, h_p, nlen) == 0 && (chp[nlen] == ':' || chp[nlen] == ' ')){
+                    char *colon = strchr(chp, ':');
+                    if(colon != nil){
+                        char *eol = strstr(colon, "\r\n");
+                        if(eol == nil) eol = strchr(colon, '\n');
+                        char *val = colon + 1;
+                        while(*val == ' ' || *val == '\t') val++;
+                        int vlen = (eol != nil) ? (eol - val) : strlen(val);
+
+                        char *cleanval = malloc(vlen + 1);
+                        int cj = 0, in_sp = 0;
+                        for(int k = 0; k < vlen; k++){
+                            char c = val[k];
+                            if(c == '\r' || c == '\n') continue;
+                            if(c == ' ' || c == '\t'){
+                                if(!in_sp){ cleanval[cj++] = ' '; in_sp = 1; }
+                            } else {
+                                cleanval[cj++] = c; in_sp = 0;
+                            }
+                        }
+                        while(cj > 0 && cleanval[cj-1] == ' ') cj--;
+                        cleanval[cj] = 0;
+
+                        char *chdr = smprint("%s:%s\r\n", h_p, cleanval);
+                        strcat(to_verify, chdr);
+                        free(chdr);
+                        free(cleanval);
+                        break;
+                    }
+                }
+                char *next_line = strstr(chp, "\r\n");
+                if(next_line != nil) chp = next_line + 2;
+                else {
+                    next_line = strchr(chp, '\n');
+                    if(next_line != nil) chp = next_line + 1;
+                    else break;
+                }
+            }
+            if(next == nil) break;
+            h_p = next + 1;
+        }
+        free(h_tok);
+
+        /* Reconstruct dkim-signature header up to b= */
+        char dkim_canon_hdr[1024];
+        snprint(dkim_canon_hdr, sizeof dkim_canon_hdr,
+            "dkim-signature:v=1; a=rsa-sha256; c=relaxed/relaxed; d=%s; s=%s; h=%s; bh=%s; b=",
+            domain, selector, h_list, bh_val);
+        strcat(to_verify, dkim_canon_hdr);
+
+        uchar v_digest[SHA2_256dlen];
+        sha2_256((uchar*)to_verify, strlen(to_verify), v_digest, nil);
+
+        /* 6. Verify RSA PKCS #1 v1.5 Signature */
+        uchar sigbytes[1024];
+        int k = (mpsignif(pub->n) + 7) / 8;
+        int slen = dec64(sigbytes, sizeof sigbytes, b64sig, strlen(b64sig));
+        if(slen <= 0){
+            report = smprint("fail\n%s\n%s\nbad base64 signature", domain, selector);
+            goto dkim_ver_finish;
+        }
+
+        mpint *sig_in = betomp(sigbytes, slen, nil);
+        mpint *plain = rsaencrypt(pub, sig_in, nil);
+        uchar plainbytes[512] = {0};
+        int plen = (mpsignif(plain) + 7) / 8;
+        mptobe(plain, plainbytes + k - plen, plen, nil);
+
+        uchar want[512] = {0};
+        want[0] = 0x00; want[1] = 0x01;
+        int padlen = k - 3 - sizeof(sha256_prefix) - sizeof(v_digest);
+        memset(want + 2, 0xFF, padlen);
+        want[2 + padlen] = 0x00;
+        memmove(want + 2 + padlen + 1, sha256_prefix, sizeof(sha256_prefix));
+        memmove(want + k - sizeof(v_digest), v_digest, sizeof(v_digest));
+
+        int ok = (memcmp(want, plainbytes, k) == 0);
+        mpfree(sig_in);
+        mpfree(plain);
+
+        if(ok){
+            report = smprint("pass\n%s\n%s\nsignature verified", domain, selector);
+        } else {
+            report = smprint("fail\n%s\n%s\nsignature verification failed", domain, selector);
+        }
+
+    dkim_ver_finish:
+        if(pub != nil) rsapubfree(pub);
+        if(c_msg != nil) free(c_msg);
+        if(report != nil){
+            out = o9_string_from_c(report);
+            free(report);
+        }
+    }
+    return out;
+}
+
+function SpfVerifyClient(string clientIp, string senderDomain) string {
+    string out;
+    c {
+        char *cip = o9_string_cstr(clientIp);
+        char *dom = o9_string_cstr(senderDomain);
+        char *res = "none";
+
+        out = nil;
+        if(cip == nil || dom == nil || cip[0] == 0 || dom[0] == 0)
+            goto spf_finish;
+
+        /* Always pass local loopback ONLY for local domain */
+        if(strcmp(cip, "127.0.0.1") == 0 || strcmp(cip, "::1") == 0){
+            char locbuf[256];
+            locbuf[0] = 0;
+            int sfd = open("/dev/sysname", OREAD);
+            if(sfd >= 0){
+                int sn = read(sfd, locbuf, sizeof(locbuf)-1);
+                close(sfd);
+                if(sn > 0){
+                    while(sn > 0 && (locbuf[sn-1] == '\n' || locbuf[sn-1] == ' ' || locbuf[sn-1] == '\r'))
+                        sn--;
+                    locbuf[sn] = 0;
+                }
+            }
+            if(locbuf[0] == 0){
+                sfd = open("/net/ndb", OREAD);
+                if(sfd >= 0){
+                    char ndb_data[4096];
+                    int sn = read(sfd, ndb_data, sizeof(ndb_data)-1);
+                    close(sfd);
+                    if(sn > 0){
+                        ndb_data[sn] = 0;
+                        char *dp = strstr(ndb_data, "dom=");
+                        if(dp != nil){
+                            dp += 4;
+                            char *dend = dp;
+                            while(*dend && *dend != ' ' && *dend != '\t' && *dend != '\n' && *dend != '\r')
+                                dend++;
+                            int dlen = dend - dp;
+                            if(dlen > 0 && dlen < sizeof(locbuf)){
+                                memmove(locbuf, dp, dlen);
+                                locbuf[dlen] = 0;
+                            }
+                        }
+                    }
+                }
+            }
+            if(cistrcmp(dom, "localhost") == 0 || (locbuf[0] != 0 && (cistrcmp(dom, locbuf) == 0 || (strlen(dom) > strlen(locbuf) && cistrcmp(dom + strlen(dom) - strlen(locbuf), locbuf) == 0)))){
+                res = "pass";
+                goto spf_finish;
+            }
+        }
+
+        /* Query /net/dns for <senderDomain> txt */
+        char qname[256];
+        snprint(qname, sizeof qname, "%s txt", dom);
+        int dfd = open("/net/dns", ORDWR);
+        char dnsbuf[8192];
+        int dtot = 0;
+        if(dfd >= 0){
+            seek(dfd, 0, 0);
+            write(dfd, qname, strlen(qname));
+            seek(dfd, 0, 0);
+            int dn;
+            while(dtot < sizeof(dnsbuf) - 1){
+                dn = read(dfd, dnsbuf + dtot, sizeof(dnsbuf) - 1 - dtot);
+                if(dn <= 0) break;
+                dtot += dn;
+            }
+            close(dfd);
+        }
+        dnsbuf[dtot] = 0;
+
+        char *spf_p = strstr(dnsbuf, "v=spf1");
+        if(spf_p == nil){
+            res = "none";
+            goto spf_finish;
+        }
+
+        /* Parse IPv4 client */
+        char *p = cip;
+        int a = atoi(p); p = strchr(p, '.');
+        int b = p ? atoi(p+1) : 0; p = p ? strchr(p+1, '.') : nil;
+        int c = p ? atoi(p+1) : 0; p = p ? strchr(p+1, '.') : nil;
+        int d = p ? atoi(p+1) : 0;
+        ulong c_num = (((ulong)(a&0xFF))<<24) | (((ulong)(b&0xFF))<<16) | (((ulong)(c&0xFF))<<8) | ((ulong)(d&0xFF));
+
+        /* Scan SPF mechanisms */
+        char *tok = spf_p;
+        res = "neutral";
+        while(tok != nil && *tok != 0){
+            while(*tok == ' ' || *tok == '\t') tok++;
+            if(strncmp(tok, "ip4:", 4) == 0){
+                tok += 4;
+                char cidr[64];
+                int ci = 0;
+                while(*tok && *tok != ' ' && *tok != '\t' && *tok != '\r' && *tok != '\n' && ci < sizeof(cidr)-1)
+                    cidr[ci++] = *tok++;
+                cidr[ci] = 0;
+
+                int prefix = 32;
+                char *slash = strchr(cidr, '/');
+                if(slash != nil){
+                    *slash = 0;
+                    prefix = atoi(slash + 1);
+                    if(prefix < 0) prefix = 0;
+                    if(prefix > 32) prefix = 32;
+                }
+                char *np = cidr;
+                int na = atoi(np); np = strchr(np, '.');
+                int nb = np ? atoi(np+1) : 0; np = np ? strchr(np+1, '.') : nil;
+                int nc = np ? atoi(np+1) : 0; np = np ? strchr(np+1, '.') : nil;
+                int nd = np ? atoi(np+1) : 0;
+                ulong n_num = (((ulong)(na&0xFF))<<24) | (((ulong)(nb&0xFF))<<16) | (((ulong)(nc&0xFF))<<8) | ((ulong)(nd&0xFF));
+
+                ulong mask = (prefix == 0) ? 0 : (~0UL << (32 - prefix));
+                if((c_num & mask) == (n_num & mask)){
+                    res = "pass";
+                    goto spf_finish;
+                }
+            } else if(strncmp(tok, "-all", 4) == 0){
+                res = "fail";
+                tok += 4;
+            } else if(strncmp(tok, "~all", 4) == 0){
+                res = "softfail";
+                tok += 4;
+            } else if(strncmp(tok, "+all", 4) == 0){
+                res = "pass";
+                tok += 4;
+            } else if(strncmp(tok, "?all", 4) == 0){
+                res = "neutral";
+                tok += 4;
+            } else {
+                while(*tok && *tok != ' ' && *tok != '\t' && *tok != '\r' && *tok != '\n') tok++;
+            }
+        }
+
+    spf_finish:
+        if(cip != nil) free(cip);
+        if(dom != nil) free(dom);
+        out = o9_string_from_c(res);
+    }
+    return out;
+}
+
+function DmarcEvaluatePolicy(string fromDomain, string spfDomain, string spfResult, string dkimDomain, string dkimResult) string {
+    string out;
+    c {
+        char *fdom = o9_string_cstr(fromDomain);
+        char *sdom = o9_string_cstr(spfDomain);
+        char *sres = o9_string_cstr(spfResult);
+        char *ddom = o9_string_cstr(dkimDomain);
+        char *dres = o9_string_cstr(dkimResult);
+
+        char *dmarc_res = "fail";
+        char *policy = "none";
+        char *action = "accept";
+        char *report = nil;
+
+        out = nil;
+        if(fdom == nil || fdom[0] == 0) goto dmarc_finish;
+
+        /* 1. Query _dmarc.<fromDomain> txt from DNS */
+        char qname[256];
+        snprint(qname, sizeof qname, "_dmarc.%s txt", fdom);
+        int dfd = open("/net/dns", ORDWR);
+        char dnsbuf[4096];
+        int dtot = 0;
+        if(dfd >= 0){
+            seek(dfd, 0, 0);
+            write(dfd, qname, strlen(qname));
+            seek(dfd, 0, 0);
+            int dn;
+            while(dtot < sizeof(dnsbuf) - 1){
+                dn = read(dfd, dnsbuf + dtot, sizeof(dnsbuf) - 1 - dtot);
+                if(dn <= 0) break;
+                dtot += dn;
+            }
+            close(dfd);
+        }
+        dnsbuf[dtot] = 0;
+
+        char *dmarc_p = strstr(dnsbuf, "v=DMARC1");
+        if(dmarc_p == nil){
+            /* No DMARC record published: RFC 7489 result is 'none' */
+            dmarc_res = "none";
+            policy = "none";
+            action = "accept";
+            report = smprint("%s\n%s\n%s\n%s", dmarc_res, policy, action, fdom);
+            goto dmarc_finish;
+        }
+
+        char *p_tag = strstr(dmarc_p, "p=");
+        if(p_tag != nil){
+            p_tag += 2;
+            if(strncmp(p_tag, "reject", 6) == 0) policy = "reject";
+            else if(strncmp(p_tag, "quarantine", 10) == 0) policy = "quarantine";
+            else policy = "none";
+        }
+
+        /* 2. Check Identifier Alignment */
+        int spf_aligned = 0;
+        if(sres != nil && strcmp(sres, "pass") == 0 && sdom != nil){
+            if(cistrcmp(fdom, sdom) == 0 || (strlen(fdom) > strlen(sdom) && cistrcmp(fdom + strlen(fdom) - strlen(sdom), sdom) == 0))
+                spf_aligned = 1;
+        }
+
+        int dkim_aligned = 0;
+        if(dres != nil && strcmp(dres, "pass") == 0 && ddom != nil){
+            if(cistrcmp(fdom, ddom) == 0 || (strlen(fdom) > strlen(ddom) && cistrcmp(fdom + strlen(fdom) - strlen(ddom), ddom) == 0))
+                dkim_aligned = 1;
+        }
+
+        if(spf_aligned || dkim_aligned){
+            dmarc_res = "pass";
+            action = "accept";
+        } else {
+            dmarc_res = "fail";
+            if(strcmp(policy, "reject") == 0) action = "reject";
+            else if(strcmp(policy, "quarantine") == 0) action = "quarantine";
+            else action = "accept";
+        }
+
+        report = smprint("%s\n%s\n%s\n%s", dmarc_res, policy, action, fdom);
+
+    dmarc_finish:
+        if(fdom != nil) free(fdom);
+        if(sdom != nil) free(sdom);
+        if(sres != nil) free(sres);
+        if(ddom != nil) free(ddom);
+        if(dres != nil) free(dres);
+
+        if(report != nil){
+            out = o9_string_from_c(report);
+            free(report);
+        }
+    }
+    return out;
+}
+
+function FormatAuthResultsHeader(string localDomain, string clientIp, string mailFrom, string spfRes, string dkimRes, string dkimDom, string dkimSel, string dmarcRes, string dmarcPol, string dmarcAct, string fromDom) string {
+    string out;
+    c {
+        char *ldom = o9_string_cstr(localDomain);
+        char *cip = o9_string_cstr(clientIp);
+        char *mfrom = o9_string_cstr(mailFrom);
+        char *sres = o9_string_cstr(spfRes);
+        char *dres = o9_string_cstr(dkimRes);
+        char *ddom = o9_string_cstr(dkimDom);
+        char *dsel = o9_string_cstr(dkimSel);
+        char *dmres = o9_string_cstr(dmarcRes);
+        char *dmpol = o9_string_cstr(dmarcPol);
+        char *dmact = o9_string_cstr(dmarcAct);
+        char *fdom = o9_string_cstr(fromDom);
+
+        char *hdr = smprint(
+            "Authentication-Results: %s;\r\n"
+            "  dkim=%s header.d=%s header.s=%s;\r\n"
+            "  spf=%s (client-ip=%s; envelope-from=<%s>);\r\n"
+            "  dmarc=%s (p=%s action=%s) header.from=%s\r\n",
+            ldom ? ldom : "localhost",
+            dres ? dres : "none", ddom ? ddom : "none", dsel ? dsel : "none",
+            sres ? sres : "none", cip ? cip : "unknown", mfrom ? mfrom : "",
+            dmres ? dmres : "none", dmpol ? dmpol : "none", dmact ? dmact : "none", fdom ? fdom : "none"
+        );
+
+        out = o9_string_from_c(hdr);
+        free(hdr);
+        if(ldom) free(ldom);
+        if(cip) free(cip);
+        if(mfrom) free(mfrom);
+        if(sres) free(sres);
+        if(dres) free(dres);
+        if(ddom) free(ddom);
+        if(dsel) free(dsel);
+        if(dmres) free(dmres);
+        if(dmpol) free(dmpol);
+        if(dmact) free(dmact);
+        if(fdom) free(fdom);
+    }
+    return out;
+}
+
+function SmtpLocalDomainRaw() string {
+    string out;
+    c {
+        char buf[256];
+        int fd, n;
+
+        buf[0] = 0;
+        /* 1. Try reading /net/ndb for configured dom= */
+        fd = open("/net/ndb", OREAD);
+        if(fd >= 0){
+            char ndb_data[4096];
+            n = read(fd, ndb_data, sizeof(ndb_data)-1);
+            close(fd);
+            if(n > 0){
+                ndb_data[n] = 0;
+                char *p = strstr(ndb_data, "dom=");
+                if(p != nil){
+                    p += 4;
+                    char *end = p;
+                    while(*end && *end != ' ' && *end != '\t' && *end != '\n' && *end != '\r')
+                        end++;
+                    int len = end - p;
+                    if(len > 0 && len < sizeof(buf)){
+                        memmove(buf, p, len);
+                        buf[len] = 0;
+                    }
+                }
+            }
+        }
+
+        /* 2. Try /dev/sysname */
+        if(buf[0] == 0){
+            fd = open("/dev/sysname", OREAD);
+            if(fd >= 0){
+                n = read(fd, buf, sizeof(buf)-1);
+                close(fd);
+                if(n > 0){
+                    while(n > 0 && (buf[n-1] == '\n' || buf[n-1] == ' ' || buf[n-1] == '\r'))
+                        n--;
+                    buf[n] = 0;
+                }
+            }
+        }
+
+        if(buf[0] != 0){
+            out = o9_string_from_c(buf);
+        } else {
+            out = o9_string_from_c("localhost");
+        }
+    }
+    return out;
+}

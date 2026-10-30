@@ -1,0 +1,116 @@
+import "stdlib/process.o9";
+import "stdlib/string.o9";
+
+// DKIM Key Generator and DNS Record Publisher for o9mail
+// Generates standard 2048-bit RSA keypair, exports factotum/private key,
+// and formats DNS TXT records for DKIM, SPF, and DMARC.
+
+function DkimGenKeyRaw(string domain, string selector, string outKeyPath) string {
+    use { sec mp }
+    string out;
+    c {
+        char *dom = o9_string_cstr(domain);
+        char *sel = o9_string_cstr(selector);
+        char *path = o9_string_cstr(outKeyPath);
+        RSApriv *priv;
+        uchar spki[1024];
+        char b64spki[2048];
+        char *keytext, *report;
+        int spkilen, b64len, fd;
+
+        fmtinstall('B', mpfmt);
+
+        out = nil;
+        if(dom == nil || dom[0] == 0) dom = strdup("localhost");
+        if(sel == nil || sel[0] == 0) sel = strdup("default");
+
+        /* Generate 2048-bit RSA key */
+        priv = rsagen(2048, 6, 0);
+        if(priv == nil){
+            report = smprint("error: rsagen failed\n");
+            out = o9_string_from_c(report);
+            free(report);
+            goto dkim_gen_done;
+        }
+
+        /* SubjectPublicKeyInfo DER encoding */
+        spkilen = asn1encodeRSApubSPKI(&priv->pub, spki, sizeof spki);
+        if(spkilen <= 0){
+            report = smprint("error: asn1encodeRSApubSPKI failed\n");
+            out = o9_string_from_c(report);
+            free(report);
+            rsaprivfree(priv);
+            goto dkim_gen_done;
+        }
+        b64len = enc64(b64spki, sizeof b64spki, spki, spkilen);
+        b64spki[b64len] = 0;
+
+        /* Plan 9 factotum format private key string */
+        keytext = smprint("key proto=rsa service=dkim domain=%s selector=%s size=%d ek=%B !dk=%B n=%B !p=%B !q=%B !kp=%B !kq=%B !c2=%B\n",
+            dom, sel, mpsignif(priv->pub.n), priv->pub.ek, priv->dk, priv->pub.n, priv->p, priv->q, priv->kp, priv->kq, priv->c2);
+
+        /* Write private key file if path provided */
+        if(path != nil && path[0] != 0){
+            fd = create(path, OWRITE, 0600);
+            if(fd >= 0){
+                write(fd, keytext, strlen(keytext));
+                close(fd);
+            }
+        }
+
+        report = smprint(
+            "=== o9mail DKIM Key Generated ===\n"
+            "Domain:   %s\n"
+            "Selector: %s\n"
+            "Key Size: %d bits\n"
+            "Key File: %s\n\n"
+            "; --- DNS Records to Publish ---\n"
+            "; 1. DKIM Public Key (TXT)\n"
+            "%s._domainkey.%s. IN TXT \"v=DKIM1; k=rsa; p=%s\"\n\n"
+            "; 2. SPF Policy (TXT)\n"
+            "%s. IN TXT \"v=spf1 mx -all\"\n\n"
+            "; 3. DMARC Alignment & Policy (TXT)\n"
+            "_dmarc.%s. IN TXT \"v=DMARC1; p=quarantine; aspf=r; adkim=r; rua=mailto:postmaster@%s\"\n",
+            dom, sel, mpsignif(priv->pub.n), (path != nil && path[0] != 0) ? path : "(none)",
+            sel, dom, b64spki,
+            dom,
+            dom, dom
+        );
+
+        out = o9_string_from_c(report);
+        free(report);
+        free(keytext);
+        rsaprivfree(priv);
+
+    dkim_gen_done:
+        if(dom != nil) free(dom);
+        if(sel != nil) free(sel);
+        if(path != nil) free(path);
+    }
+    return out;
+}
+
+main {
+    Task<string> arg1Task = spawn ProcessArgRaw(1);
+    Task<string> arg2Task = spawn ProcessArgRaw(2);
+    Task<string> arg3Task = spawn ProcessArgRaw(3);
+    Task<string> arg4Task = spawn ProcessArgRaw(4);
+
+    string cmd = arg1Task.await();
+    string domain = arg2Task.await();
+    string selector = arg3Task.await();
+    string keyPath = arg4Task.await();
+
+    if(cmp(cmd, "genkey") == 0 && len(domain) > 0) {
+        if(len(selector) == 0) {
+            selector = "default";
+        }
+        if(len(keyPath) == 0) {
+            keyPath = cat(cat("/tmp/dkim_", domain), ".key");
+        }
+        Task<string> gen = spawn DkimGenKeyRaw(domain, selector, keyPath);
+        print(gen.await());
+    } else {
+        print("usage: o9dkim genkey DOMAIN [SELECTOR] [OUT_KEY_FILE]\n");
+    }
+}

@@ -3,6 +3,7 @@ import "stdlib/view.o9";
 import "stdlib/process.o9";
 import "stdlib/collections.o9";
 import "stdlib/string.o9";
+import "security.o9";
 
 // All paths below are made from a private root, a verified AppUser principal,
 // and a server-generated hex identifier. Nothing supplied over 9P is a path.
@@ -1429,6 +1430,29 @@ class MailView {
                 rawMsg = cat(rawMsg, cat(b, "\n"));
             }
             string senderAddr = cat(cat(principal, "@"), domain);
+
+            // Check for DKIM key to sign outbound mail
+            string dkimKey = "";
+            string k1 = cat(cat("/mail/o9mail/dkim_", domain), ".key");
+            string k2 = cat(cat("/tmp/dkim_", domain), ".key");
+            string k3 = "/mail/o9mail/dkim.key";
+            if(disk.exists(k1)) {
+                dkimKey = k1;
+            } else if(disk.exists(k2)) {
+                dkimKey = k2;
+            } else if(disk.exists(k3)) {
+                dkimKey = k3;
+            }
+
+            if(len(dkimKey) > 0) {
+                print("mailfs: signing outbox message with DKIM (key: ", dkimKey, ")\n");
+                Task<string> signTask = spawn DkimSignMessage(domain, "2026", dkimKey, rawMsg);
+                string signedMsg = signTask.await();
+                if(signedMsg != nil && len(signedMsg) > 0) {
+                    rawMsg = signedMsg;
+                }
+            }
+
             string err = disk.deliver(smarthost, smtpPort, domain, senderAddr, targetTo, rawMsg);
             if(err != nil && len(err) > 0) {
                 outboxStatus.set(id, cat("error: ", cat(err, "\n")));

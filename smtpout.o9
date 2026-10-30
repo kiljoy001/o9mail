@@ -1,5 +1,6 @@
 import "stdlib/process.o9";
 import "stdlib/appuser.o9";
+import "security.o9";
 
 function DnsResolveMxRaw(string domain) string {
     use { bio ndb }
@@ -97,54 +98,15 @@ function SmtpReadReplyRaw(int64 cfd) string {
     return out;
 }
 
-function SmtpLocalDomainRaw() string {
-    string out;
+function SmtpKeyExistsRaw(string path) bool {
+    bool out;
     c {
-        char buf[256];
-        int fd, n;
-
-        buf[0] = 0;
-        /* 1. Try reading /net/ndb for configured dom= */
-        fd = open("/net/ndb", OREAD);
-        if(fd >= 0){
-            char ndb_data[4096];
-            n = read(fd, ndb_data, sizeof(ndb_data)-1);
-            close(fd);
-            if(n > 0){
-                ndb_data[n] = 0;
-                char *p = strstr(ndb_data, "dom=");
-                if(p != nil){
-                    p += 4;
-                    char *end = p;
-                    while(*end && *end != ' ' && *end != '\t' && *end != '\n' && *end != '\r')
-                        end++;
-                    int len = end - p;
-                    if(len > 0 && len < sizeof(buf)){
-                        memmove(buf, p, len);
-                        buf[len] = 0;
-                    }
-                }
-            }
-        }
-
-        /* 2. Try /dev/sysname */
-        if(buf[0] == 0){
-            fd = open("/dev/sysname", OREAD);
-            if(fd >= 0){
-                n = read(fd, buf, sizeof(buf)-1);
-                close(fd);
-                if(n > 0){
-                    while(n > 0 && (buf[n-1] == '\n' || buf[n-1] == ' ' || buf[n-1] == '\r'))
-                        n--;
-                    buf[n] = 0;
-                }
-            }
-        }
-
-        if(buf[0] != 0){
-            out = o9_string_from_c(buf);
-        } else {
-            out = o9_string_from_c("localhost");
+        char *p = o9_string_cstr(path);
+        out = 0;
+        if(p != nil){
+            if(access(p, AREAD) == 0)
+                out = 1;
+            free(p);
         }
     }
     return out;
@@ -555,6 +517,11 @@ class SmtpOut {
         Task<int64> t = spawn SmtpAtoiRaw(s);
         return t.await();
     }
+
+    method bool keyExists(string path) {
+        Task<bool> t = spawn SmtpKeyExistsRaw(path);
+        return t.await();
+    }
 }
 
 main {
@@ -568,6 +535,8 @@ main {
     string sender = "";
     string to = "";
     string msgPath = "-";
+    string keyPath = "";
+    string selector = "2026";
 
     int64 idx = 1;
     while(idx < argCount) {
@@ -586,6 +555,14 @@ main {
             idx = idx + 1;
             Task<string> dTask = spawn ProcessArgRaw(idx);
             domain = dTask.await();
+        } else if(cmp(arg, "-k") == 0 && idx + 1 < argCount) {
+            idx = idx + 1;
+            Task<string> kTask = spawn ProcessArgRaw(idx);
+            keyPath = kTask.await();
+        } else if(cmp(arg, "-sel") == 0 && idx + 1 < argCount) {
+            idx = idx + 1;
+            Task<string> selTask = spawn ProcessArgRaw(idx);
+            selector = selTask.await();
         } else if(len(sender) == 0) {
             sender = arg;
         } else if(len(to) == 0) {
@@ -601,12 +578,35 @@ main {
     }
 
     if(len(sender) == 0 || len(to) == 0) {
-        print("usage: smtpout [-s smarthost] [-p port] [-d domain] FROM TO [MESSAGE_FILE]\n");
+        print("usage: smtpout [-s smarthost] [-p port] [-d domain] [-k keyfile] [-sel selector] FROM TO [MESSAGE_FILE]\n");
     } else {
         string body = client.readInput(msgPath);
         if(body == nil || len(body) == 0) {
             print("smtpout: error: empty message body\n");
         } else {
+            // Auto-discover DKIM key if not explicitly provided
+            if(len(keyPath) == 0) {
+                string cand1 = cat(cat("/mail/o9mail/dkim_", domain), ".key");
+                string cand2 = cat(cat("/tmp/dkim_", domain), ".key");
+                string cand3 = "/mail/o9mail/dkim.key";
+                if(client.keyExists(cand1)) {
+                    keyPath = cand1;
+                } else if(client.keyExists(cand2)) {
+                    keyPath = cand2;
+                } else if(client.keyExists(cand3)) {
+                    keyPath = cand3;
+                }
+            }
+
+            if(len(keyPath) > 0) {
+                print("smtpout: signing message with DKIM (selector: ", selector, ", key: ", keyPath, ")\n");
+                Task<string> signTask = spawn DkimSignMessage(domain, selector, keyPath, body);
+                string signedMsg = signTask.await();
+                if(signedMsg != nil && len(signedMsg) > 0) {
+                    body = signedMsg;
+                }
+            }
+
             string err = client.deliver(smarthost, port, domain, sender, to, body);
             if(err != nil && len(err) > 0) {
                 print("smtpout: delivery failed: ", err, "\n");
