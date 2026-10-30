@@ -1,0 +1,683 @@
+import "stdlib/process.o9";
+import "stdlib/string.o9";
+import "stdlib/net.o9";
+
+// Low-level network, crypto, and filesystem primitives for RFC 5321 SMTP server
+// with zero-knowledge hybrid public-key sealing.
+
+function SmtpAnnounceRaw(string address) string {
+    string out;
+    c {
+        char *addr;
+        char dir[128];
+        char buf[192];
+        int fd;
+
+        out = o9_string_new("", 0);
+        addr = o9_string_cstr(address);
+        if(addr != nil){
+            fd = announce(addr, dir);
+            if(fd >= 0){
+                snprint(buf, sizeof buf, "%d\n%s", fd, dir);
+                out = o9_string_from_c(buf);
+            }
+            free(addr);
+        }
+    }
+    return out;
+}
+
+function SmtpAcceptRaw(string token) int64 {
+    int64 out;
+    c {
+        char *tok, *p, *dir;
+        char ldir[128];
+        int lfd, dfd;
+
+        out = -1;
+        tok = o9_string_cstr(token);
+        if(tok != nil){
+            p = strchr(tok, '\n');
+            if(p != nil){
+                dir = p + 1;
+                lfd = listen(dir, ldir);
+                if(lfd >= 0){
+                    dfd = accept(lfd, ldir);
+                    close(lfd);
+                    if(dfd >= 0)
+                        out = dfd;
+                }
+            }
+            free(tok);
+        }
+    }
+    return out;
+}
+
+function SmtpCloseRaw(int64 fd) int64 {
+    int64 out;
+    c {
+        out = -1;
+        if(fd >= 0)
+            out = close((int)fd);
+    }
+    return out;
+}
+
+// Reads a single CRLF-terminated line from socket.
+// Returns nil on EOF or disconnection.
+// Caps line length at 2048 bytes per RFC 5321 §4.5.3.1.
+function SmtpReadLineRaw(int64 fd) string {
+    string out;
+    c {
+        char buf[2048];
+        int n;
+        char c;
+        int r;
+
+        out = nil;
+        if(fd >= 0){
+            n = 0;
+            while(n < sizeof(buf) - 1){
+                r = read((int)fd, &c, 1);
+                if(r <= 0){
+                    if(n > 0)
+                        out = o9_string_new(buf, n);
+                    break;
+                }
+                if(c == '\r')
+                    continue;
+                if(c == '\n'){
+                    out = o9_string_new(buf, n);
+                    break;
+                }
+                buf[n++] = c;
+            }
+            if(n >= sizeof(buf) - 1 && out == nil)
+                out = o9_string_new(buf, n);
+        }
+    }
+    return out;
+}
+
+function SmtpWriteLineRaw(int64 fd, string line) int64 {
+    int64 out;
+    c {
+        char *p;
+        int n;
+        int ok;
+
+        out = -1;
+        if(fd >= 0){
+            p = o9_string_cstr(line);
+            if(p != nil){
+                n = o9_string_len(line);
+                ok = 1;
+                if(n > 0 && write((int)fd, p, n) != n)
+                    ok = 0;
+                if(write((int)fd, "\r\n", 2) != 2)
+                    ok = 0;
+                free(p);
+                if(ok)
+                    out = n + 2;
+            }
+        }
+    }
+    return out;
+}
+
+// Seals an ephemeral 32-byte symmetric key with recipient's RSA public key
+// using PKCS #1 v1.5 block type 2 (encryption) padding.
+function SmtpRSAEncryptRaw(string modulus, string exponent, string keyhex) string {
+    use { sec mp }
+    string out;
+    c {
+        RSApub pub;
+        mpint *in, *cipher;
+        char *nhex, *ehex, *khex;
+        uchar rawkey[32];
+        char *chex;
+        int i, hi, lo;
+
+        out = nil;
+        nhex = o9_string_cstr(modulus);
+        ehex = o9_string_cstr(exponent);
+        khex = o9_string_cstr(keyhex);
+        if(nhex != nil && ehex != nil && khex != nil && o9_string_len(keyhex) == 64){
+            pub.n = strtomp(nhex, nil, 16, nil);
+            pub.ek = strtomp(ehex, nil, 16, nil);
+            if(pub.n != nil && pub.ek != nil){
+                for(i = 0; i < 32; i++){
+                    hi = khex[2*i];
+                    lo = khex[2*i+1];
+                    hi = (hi >= '0' && hi <= '9') ? hi - '0' : (hi >= 'a' && hi <= 'f') ? hi - 'a' + 10 : 0;
+                    lo = (lo >= '0' && lo <= '9') ? lo - '0' : (lo >= 'a' && lo <= 'f') ? lo - 'a' + 10 : 0;
+                    rawkey[i] = (hi << 4) | lo;
+                }
+                in = pkcs1padbuf(rawkey, 32, pub.n, 2);
+                if(in != nil){
+                    cipher = rsaencrypt(&pub, in, nil);
+                    mpfree(in);
+                    if(cipher != nil){
+                        chex = mptoa(cipher, 16, nil, 0);
+                        mpfree(cipher);
+                        if(chex != nil){
+                            out = o9_string_from_c(chex);
+                            free(chex);
+                        }
+                    }
+                }
+            }
+            if(pub.n != nil) mpfree(pub.n);
+            if(pub.ek != nil) mpfree(pub.ek);
+        }
+        if(nhex != nil) free(nhex);
+        if(ehex != nil) free(ehex);
+        if(khex != nil) free(khex);
+    }
+    return out;
+}
+
+// O9MAIL2 envelope format: "O9MAIL2\n" + 2-byte big-endian source length + source + raw message.
+function SmtpEnvelopeRaw(string source, string raw) string {
+    string out;
+    c {
+        vlong ns, nr;
+        char *p;
+        out = nil;
+        if(source != nil && raw != nil){
+            ns = o9_string_len(source);
+            nr = o9_string_len(raw);
+            if(ns >= 0 && ns <= 512 && nr >= 0 && nr <= 65536){
+                out = o9_string_new(nil, 10 + ns + nr);
+                if(out != nil){
+                    p = o9_string_data(out);
+                    memmove(p, "O9MAIL2\n", 8);
+                    p[8] = (ns >> 8) & 0xff;
+                    p[9] = ns & 0xff;
+                    memmove(p + 10, o9_string_data(source), ns);
+                    memmove(p + 10 + ns, o9_string_data(raw), nr);
+                }
+            }
+        }
+    }
+    return out;
+}
+
+function SmtpPrivateDirRaw(string path) int64 {
+    int64 ok;
+    c {
+        char *p;
+        Dir *d;
+        int fd;
+
+        ok = 0;
+        p = o9_string_cstr(path);
+        if(p != nil){
+            d = dirstat(p);
+            if(d == nil){
+                fd = create(p, OREAD, DMDIR|0700);
+                if(fd >= 0)
+                    close(fd);
+                d = dirstat(p);
+            }
+            if(d != nil){
+                if((d->mode & DMDIR) && (d->mode & 077) == 0)
+                    ok = 1;
+                free(d);
+            }
+            free(p);
+        }
+    }
+    return ok;
+}
+
+function SmtpPrivateWriteRaw(string path, string data) int64 {
+    int64 ok;
+    c {
+        char *p;
+        int fd;
+        vlong n;
+
+        ok = -1;
+        p = o9_string_cstr(path);
+        if(p != nil){
+            fd = create(p, OWRITE, 0600);
+            free(p);
+            if(fd >= 0){
+                n = o9_string_len(data);
+                if(write(fd, o9_string_data(data), n) == n)
+                    ok = n;
+                close(fd);
+            }
+        }
+    }
+    return ok;
+}
+
+function SmtpSpoolWriteRaw(string spoolDir, string mid, string sender, string rcpt, string data) int64 {
+    int64 out;
+    c {
+        char *dir, *id, *s, *r, *d;
+        char path[256];
+        int fd;
+        Dir *st;
+
+        out = -1;
+        dir = o9_string_cstr(spoolDir);
+        id = o9_string_cstr(mid);
+        s = o9_string_cstr(sender);
+        r = o9_string_cstr(rcpt);
+        d = o9_string_cstr(data);
+
+        if(dir != nil && id != nil && d != nil){
+            st = dirstat(dir);
+            if(st == nil){
+                fd = create(dir, OREAD, DMDIR|0700);
+                if(fd >= 0)
+                    close(fd);
+            } else {
+                free(st);
+            }
+
+            snprint(path, sizeof path, "%s/%s.eml", dir, id);
+            fd = create(path, OWRITE, 0600);
+            if(fd >= 0){
+                if(s != nil && s[0] != '\0')
+                    fprint(fd, "Return-Path: <%s>\r\n", s);
+                if(r != nil && r[0] != '\0')
+                    fprint(fd, "X-Envelope-To: <%s>\r\n", r);
+                write(fd, d, o9_string_len(data));
+                close(fd);
+                out = o9_string_len(data);
+            }
+        }
+        if(dir != nil) free(dir);
+        if(id != nil) free(id);
+        if(s != nil) free(s);
+        if(r != nil) free(r);
+        if(d != nil) free(d);
+    }
+    return out;
+}
+
+class SmtpSession {
+    private int64 fd;
+    private string domain;
+    private string keysPath;
+    private string mailRoot;
+    private string spoolDir;
+    private int64 sessionState;
+    private string heloName;
+    private string sender;
+    private string recipient;
+
+    method SmtpSession(int64 connFd, string srvDomain, string trustedKeys, string mailBoxRoot, string spool) {
+        fd = connFd;
+        domain = srvDomain;
+        keysPath = trustedKeys;
+        mailRoot = mailBoxRoot;
+        spoolDir = spool;
+        sessionState = 0; // 0 = GREET, 1 = READY, 2 = MAIL, 3 = RCPT
+        heloName = "";
+        sender = "";
+        recipient = "";
+    }
+
+    private method bool write(string text) {
+        Task<int64> t = spawn SmtpWriteLineRaw(fd, text);
+        return t.await() > 0;
+    }
+
+    private method string read() {
+        Task<string> t = spawn SmtpReadLineRaw(fd);
+        return t.await();
+    }
+
+    private method string extractAddress(string param) {
+        String s = new String(param);
+        int64 openPos = s.indexOf("<");
+        int64 closePos = s.indexOf(">");
+        if(openPos >= 0 && closePos > openPos) {
+            return s.slice(openPos + 1, closePos - openPos - 1);
+        }
+        int64 colonPos = s.indexOf(":");
+        if(colonPos >= 0) {
+            String afterColon = new String(s.slice(colonPos + 1, s.length() - colonPos - 1));
+            return afterColon.trim();
+        }
+        return s.trim();
+    }
+
+    private method string extractLocalPart(string address) {
+        String s = new String(address);
+        int64 atPos = s.indexOf("@");
+        if(atPos >= 0) {
+            return s.slice(0, atPos);
+        }
+        return address;
+    }
+
+    private method bool validateRecipient(string address) {
+        if(len(keysPath) == 0) {
+            return true;
+        }
+        string local = extractLocalPart(address);
+        if(len(local) == 0) {
+            return false;
+        }
+        tabula keys = new tabula(keysPath);
+        tabula q = keys.query("id", local);
+        int64 found = q.first();
+        keys.close();
+        return found != 0;
+    }
+
+    method void greet() {
+        write(cat(cat("220 ", domain), " ESMTP o9mail Service Ready"));
+    }
+
+    private method bool deliverHybrid(string mid, string localPart, string body) {
+        if(len(keysPath) == 0 || len(mailRoot) == 0) {
+            return false;
+        }
+        tabula keys = new tabula(keysPath);
+        string mod = keys.value(localPart, "modulus");
+        string exp = keys.value(localPart, "exponent");
+        keys.close();
+        if(len(mod) < 128 || len(exp) == 0) {
+            return false;
+        }
+
+        // 1. Pack O9MAIL2 envelope with stable source key
+        string srcKey = cat(cat("smtp:", sender), cat(":", mid));
+        Task<string> envTask = spawn SmtpEnvelopeRaw(srcKey, body);
+        string envelope = envTask.await();
+        if(envelope == nil) {
+            return false;
+        }
+
+        // 2. Generate random 32-byte message key (64 hex characters)
+        string k = keygen();
+
+        // 3. Encrypt envelope with Monocypher XChaCha20-Poly1305 AEAD
+        string ciphertext = encrypt(k, envelope);
+        if(len(ciphertext) == 0) {
+            return false;
+        }
+
+        // 4. Seal ephemeral message key with recipient's RSA public key
+        Task<string> rsaTask = spawn SmtpRSAEncryptRaw(mod, exp, k);
+        string sealedKey = rsaTask.await();
+        if(sealedKey == nil || len(sealedKey) == 0) {
+            return false;
+        }
+
+        // 5. Assemble O9SEAL1 hybrid container:
+        // O9SEAL1\n<sealed_key_hex>\n<ciphertext_hex>
+        string blob = cat(cat("O9SEAL1\n", cat(sealedKey, "\n")), ciphertext);
+
+        // 6. Ensure private 0700 mailbox directory exists and write 0600 .enc file
+        string userMaildir = cat(cat(mailRoot, "/"), localPart);
+        Task<int64> dirTask = spawn SmtpPrivateDirRaw(userMaildir);
+        if(dirTask.await() != 1) {
+            return false;
+        }
+        string destPath = cat(cat(cat(userMaildir, "/"), mid), ".enc");
+        Task<int64> writeTask = spawn SmtpPrivateWriteRaw(destPath, blob);
+        int64 written = writeTask.await();
+        if(written > 0) {
+            print("smtpd: zero-knowledge sealed message ", mid, " stored in ", destPath, " (", written, " bytes)\n");
+            return true;
+        }
+        return false;
+    }
+
+    private method bool handleData() {
+        if(!write("354 Start mail input; end with <CRLF>.<CRLF>")) {
+            return false;
+        }
+
+        string body = "";
+        bool overflow = false;
+        int64 maxBytes = 65536; // 64 KiB default bound
+        bool done = false;
+
+        while(!done) {
+            string line = read();
+            if(line == nil) {
+                return false;
+            }
+            if(cmp(line, ".") == 0) {
+                done = true;
+            } else {
+                // Dot unstuffing per RFC 5321 §4.5.2
+                String s = new String(line);
+                if(s.startsWith(".")) {
+                    line = s.slice(1, s.length() - 1);
+                }
+                if(len(body) + len(line) + 1 <= maxBytes) {
+                    body = cat(body, cat(line, "\n"));
+                } else {
+                    overflow = true;
+                }
+            }
+        }
+
+        if(overflow) {
+            write("552 5.3.4 Error: message size exceeds 64 KiB limit");
+        } else {
+            string mid = salt();
+            string localPart = extractLocalPart(recipient);
+            bool delivered = false;
+
+            // Attempt zero-knowledge hybrid public-key delivery into recipient vault
+            if(len(localPart) > 0) {
+                delivered = deliverHybrid(mid, localPart, body);
+            }
+
+            // Fallback to spool file if not enrolled or delivery failed
+            if(!delivered) {
+                Task<int64> spooled = spawn SmtpSpoolWriteRaw(spoolDir, mid, sender, recipient, body);
+                int64 n = spooled.await();
+                print("smtpd: spooled raw message ", mid, " from <", sender, "> for <", recipient, "> (", len(body), " bytes)\n");
+                write(cat("250 2.0.0 OK: message queued as ", mid));
+            } else {
+                write(cat("250 2.0.0 OK: delivered to recipient vault as ", mid));
+            }
+        }
+
+        // Reset mail transaction state to READY
+        sessionState = 1;
+        sender = "";
+        recipient = "";
+        return true;
+    }
+
+    method bool processCommand(string line) {
+        String raw = new String(line);
+        string trimmed = raw.trim();
+        if(len(trimmed) == 0) {
+            return true;
+        }
+
+        String s = new String(trimmed);
+        string lower = s.lower();
+        String low = new String(lower);
+
+        if(low.startsWith("quit")) {
+            write(cat("221 2.0.0 ", cat(domain, " closing connection")));
+            return false;
+        }
+
+        if(low.startsWith("noop")) {
+            write("250 2.0.0 OK");
+            return true;
+        }
+
+        if(low.startsWith("rset")) {
+            sessionState = 1;
+            sender = "";
+            recipient = "";
+            write("250 2.0.0 OK reset");
+            return true;
+        }
+
+        if(low.startsWith("helo")) {
+            heloName = s.after(" ");
+            sessionState = 1;
+            sender = "";
+            recipient = "";
+            write(cat(cat("250 ", domain), " greets you"));
+            return true;
+        }
+
+        if(low.startsWith("ehlo")) {
+            heloName = s.after(" ");
+            sessionState = 1;
+            sender = "";
+            recipient = "";
+            write(cat(cat("250-", domain), " greets you"));
+            write("250-SIZE 65536");
+            write("250-8BITMIME");
+            write("250-ENHANCEDSTATUSCODES");
+            write("250 HELP");
+            return true;
+        }
+
+        if(low.startsWith("mail from:")) {
+            if(sessionState < 1) {
+                write("503 5.5.1 Send HELO/EHLO first");
+                return true;
+            }
+            string from = extractAddress(trimmed);
+            sender = from;
+            recipient = "";
+            sessionState = 2; // MAIL state
+            write(cat("250 2.1.0 Sender <", cat(sender, "> OK")));
+            return true;
+        }
+
+        if(low.startsWith("rcpt to:")) {
+            if(sessionState < 2) {
+                write("503 5.5.1 Send MAIL FROM first");
+                return true;
+            }
+            string to = extractAddress(trimmed);
+            if(len(to) == 0) {
+                write("501 5.5.4 Missing recipient address");
+                return true;
+            }
+            if(!validateRecipient(to)) {
+                write(cat("550 5.1.1 <", cat(to, ">: User unknown")));
+                return true;
+            }
+            recipient = to;
+            sessionState = 3; // RCPT state
+            write(cat("250 2.1.5 Recipient <", cat(recipient, "> OK")));
+            return true;
+        }
+
+        if(low.equals("data")) {
+            if(sessionState < 3) {
+                write("503 5.5.1 Send RCPT TO first");
+                return true;
+            }
+            return handleData();
+        }
+
+        if(low.startsWith("vrfy")) {
+            string target = s.after(" ");
+            if(len(target) > 0 && validateRecipient(target)) {
+                write(cat("250 2.1.5 <", cat(target, "> OK")));
+            } else {
+                write("252 2.1.5 Cannot VRFY user; attempt delivery");
+            }
+            return true;
+        }
+
+        if(low.equals("help")) {
+            write("214-o9mail RFC 5321 SMTP Daemon");
+            write("214 Commands supported: HELO EHLO MAIL RCPT DATA RSET NOOP VRFY QUIT HELP");
+            return true;
+        }
+
+        write("500 5.5.2 Syntax error: command unrecognized");
+        return true;
+    }
+
+    method void run() {
+        greet();
+        bool active = true;
+        while(active) {
+            string line = read();
+            if(line == nil) {
+                active = false;
+            } else {
+                if(!processCommand(line)) {
+                    active = false;
+                }
+            }
+        }
+        Task<int64> closed = spawn SmtpCloseRaw(fd);
+        closed.await();
+    }
+}
+
+main {
+    Task<string> addrArg = spawn ProcessArgRaw(1);
+    Task<string> domainArg = spawn ProcessArgRaw(2);
+    Task<string> keysArg = spawn ProcessArgRaw(3);
+    Task<string> mailRootArg = spawn ProcessArgRaw(4);
+    Task<string> spoolArg = spawn ProcessArgRaw(5);
+
+    string address = addrArg.await();
+    string domain = domainArg.await();
+    string keysPath = keysArg.await();
+    string mailRoot = mailRootArg.await();
+    string spoolDir = spoolArg.await();
+
+    if(len(address) == 0) {
+        address = "tcp!*!2525";
+    }
+    if(len(domain) == 0) {
+        domain = "localhost";
+    }
+    if(len(mailRoot) == 0) {
+        mailRoot = "/mail/o9mail";
+    }
+    if(len(spoolDir) == 0) {
+        spoolDir = "/tmp/o9spool";
+    }
+
+    print("o9mail smtpd starting on ", address, " (domain: ", domain, ")\n");
+    if(len(keysPath) > 0) {
+        print("o9mail smtpd: recipient validation via ", keysPath, "\n");
+        print("o9mail smtpd: hybrid vault ingress target: ", mailRoot, "\n");
+    } else {
+        print("o9mail smtpd: open local recipient acceptance (no keys.tab enforced)\n");
+    }
+    print("o9mail smtpd: raw spool directory is ", spoolDir, "\n");
+
+    Task<string> announced = spawn SmtpAnnounceRaw(address);
+    string token = announced.await();
+    if(len(token) == 0) {
+        print("smtpd: failed to announce on ", address, "\n");
+    } else {
+        print("smtpd: listening for incoming SMTP connections...\n");
+        bool running = true;
+        while(running) {
+            Task<int64> accepted = spawn SmtpAcceptRaw(token);
+            int64 connFd = accepted.await();
+            if(connFd < 0) {
+                print("smtpd: accept failed or interrupted\n");
+                running = false;
+            } else {
+                print("smtpd: accepted connection fd=", connFd, "\n");
+                SmtpSession session = new SmtpSession(connFd, domain, keysPath, mailRoot, spoolDir);
+                session.run();
+                print("smtpd: session closed fd=", connFd, "\n");
+            }
+        }
+    }
+}
