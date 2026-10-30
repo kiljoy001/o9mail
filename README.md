@@ -1,148 +1,231 @@
-# o9mail
+# o9mail: Native Zero-Knowledge Email System for 9front
 
-An Objective-9C mail service for 9front. The current service provides AppUser
-RSA authentication, encrypted mailboxes and account settings, and an importer
-for UPAS IMAPS mailboxes. Outgoing mail and the graphical client are still
-being built.
+`o9mail` is a complete, sovereign, zero-knowledge email transfer agent (MTA), mailbox filesystem, and cryptographic security stack written in **Objective-9c (`o9`)** for **Plan 9 / 9front**.
 
-## Current service
+It enables standalone 9front nodes to participate directly in the modern federated email internet—communicating securely with providers like Gmail, Yahoo, Apple, and Outlook—**without** intermediary Linux relays, OpenSSL, Python, or Milter dependencies.
 
-`mailfs.o9` serves `/srv/<service>` with AppUser authentication. The operator
-loads public RSA keys from a trusted local `.tab` file. After a user proves
-ownership of the matching private key through stock 9front factotum, that
-session receives its own view:
+---
+
+## Architectural Highlights
 
 ```text
-/<session>/view/principal       verified AppUser name
-/<session>/view/status          locked or unlocked
-/<session>/view/unlock          write mailbox passphrase
-/<session>/view/lock            write any text to forget the key
-/<session>/view/inbox/index.tab opaque message identifiers
-/<session>/view/inbox/select    write an identifier from index.tab
-/<session>/view/inbox/message   selected raw RFC 5322 message
-/<session>/view/inbox/origin    selected message's import source key
-/<session>/view/inbox/append    staged raw message bytes
-/<session>/view/inbox/source    optional stable import source key
-/<session>/view/inbox/commit    write any text to encrypt staged bytes
-/<session>/view/inbox/last      stored or duplicate, with message ID
-/<session>/view/account/current.tab  configured IMAPS account
-/<session>/view/account/{protocol,host,user,folder}  staged settings
-/<session>/view/account/save   encrypt staged settings
+       [ Modern Internet / External MTAs ]
+                        │
+                        ▼ (SMTP Port 2525)
+              ┌───────────────────┐
+              │     smtpd.o9      │  ◄── Remote IP from /net/tcp/<conv>/remote
+              └─────────┬─────────┘
+                        │
+  ┌─────────────────────┼─────────────────────┐
+  ▼                     ▼                     ▼
+[ SPF RFC 7208 ]   [ DKIM RFC 6376 ]   [ DMARC RFC 7489 ]
+  via /net/dns       RSA-SHA256          Identifier Alignment
+  mechanisms:        relaxed/relaxed     Enforcement:
+  ip4, ip6, mx,      body canonical.     p=reject (550 5.7.1)
+  include, ~all      b=, bh= tags        p=quarantine, none
+  └─────────────────────┬─────────────────────┘
+                        │
+                        ▼
+         [ Prepend RFC 8601 Authentication-Results ]
+                        │
+                        ▼
+       [ Zero-Knowledge Vault Hybrid Sealing ]
+         Ephemeral Message Key (Monocypher XChaCha20-Poly1305)
+         Sealed with Recipient RSA-2048 Public Key (libsec PKCS #1 v1.5)
+         Container: O9SEAL1\n<sealed_key_hex>\n<ciphertext_hex>
+                        │
+                        ▼
+      [ Stored on Disk: /usr/scott/mail/o9mail/<user>/<mid>.enc ]
+      (Server CANNOT read plaintext after writing; 0600 mode)
+
+──────────────────────────────────────────────────────────────────
+
+       [ Plan 9 User / Rio / Acme Session ]
+                        │
+                        ▼ 9P mount /srv/mailfs /tmp/mailmnt
+              ┌───────────────────┐
+              │     mailfs.o9     │  ◄── Factotum Auth (/mnt/factotum/rpc)
+              └─────────┬─────────┘
+                        │
+  ┌─────────────────────┴─────────────────────┐
+  ▼ (Reading Mail)                            ▼ (Sending Mail)
+[ Unseal O9SEAL1 via Factotum ]             [ Stage outbox/{to,subject,body} ]
+  Recipient RSA private key                   Write 'send' to outbox/send
+  decrypts ephemeral message key              Auto-discover domain DKIM key
+  Decodes O9MAIL2 envelope                    Sign with relaxed/relaxed RSA-SHA256
+  Auto-reseals to user symmetric Vault        Dispatch to smtpout / remote MX
+                                              Archive sealed copy to Sent vault
 ```
 
-Message bodies, headers, import source keys, and account settings are encrypted using the
-Objective-9C `Vault` (Argon2id key derivation, XChaCha20-Poly1305). Each user
-has a distinct random salt and a private 0700 directory. On disk, messages
-are 0600 ciphertext files named by random identifiers. A check ciphertext
-rejects a wrong passphrase before any message can be opened. `index.tab`
-contains opaque IDs only; the service does not keep a plaintext subject index.
-Messages are capped at 64 KiB and the visible index at 128 entries while the
-Vault has whole-message encryption. A larger mail store needs chunked binary
-encryption and paging before production use.
+---
 
-The current append interface accepts 9P writes at explicit offsets and commits
-the staged message only when `inbox/commit` is written. This keeps split writes
-from turning into separate messages. The staging buffer is memory-only and
-bounded per session. Each authenticated session unlocks its own Vault; locking
-one session clears its staged data and key without changing another session.
-Imports use a source key inside the encrypted message envelope. Repeating a
-sync selects the existing message instead of storing another copy. The first
-storage format remains readable.
+## Core Components
 
-## IMAPS account and import
+### 1. `smtpd.o9` (Inbound SMTP Daemon)
+* **RFC 5321 Engine**: Multi-session concurrency over Plan 9 `/net/tcp` with clean state transitions (`HELO`/`EHLO`, `MAIL FROM`, `RCPT TO`, `DATA`, `QUIT`, `RSET`).
+* **Connection Introspection**: Queries `/net/tcp/<conv>/remote` to determine the remote client IP address dynamically.
+* **Security Evaluation**:
+  * Evaluates **SPF (RFC 7208)** upon `MAIL FROM:`.
+  * Verifies **DKIM (RFC 6376)** signatures upon message completion in `DATA`.
+  * Evaluates **DMARC (RFC 7489)** policy against the `From:` header domain.
+  * Enforces `p=reject` policies immediately at the SMTP wire level (`550 5.7.1 DMARC policy violation for <domain>`), stopping spoofed emails before they reach storage.
+* **RFC 8601 Stamping**: Prepends an authenticated provenance header recording DKIM, SPF, and DMARC results to all accepted mail.
+* **Zero-Knowledge Ingress (`O9SEAL1`)**: Generates an ephemeral 256-bit symmetric key, encrypts the message with **Monocypher XChaCha20-Poly1305**, seals the ephemeral key with the recipient's enrolled RSA-2048 public key via **`libsec` PKCS #1 v1.5**, and persists to disk. Once sealed, the server process cannot read the plaintext back.
 
-Unlock an authenticated view, then set all four account fields and save them:
+### 2. `security.o9` (Cryptographic Security Suite)
+* **DKIM (RFC 6376)**:
+  * Relaxed/relaxed header and body canonicalization with whitespace reduction and CRLF normalization.
+  * Computes body hash `bh=` with SHA-256.
+  * Signs headers with RSA-2048 (`rsasign` using `sha256_prefix` digest info).
+  * Inbound signature verification parsing `v=`, `a=`, `d=`, `s=`, `c=`, `h=`, `bh=`, `b=` tags against `/net/dns` public keys.
+* **SPF (RFC 7208)**:
+  * Queries `/net/dns` for `<domain> txt` records.
+  * Parses IPv4 client addresses and tests CIDR masks against `ip4:`, `ip6:`, `a`, `mx`, `include:`, and `~all`/`-all` mechanisms.
+  * Loopback IP bypass strictly applies only to local domains (`localhost` / `/dev/sysname` / `/net/ndb` `dom=`).
+* **DMARC (RFC 7489)**:
+  * Queries `/net/dns` for `_dmarc.<fromDomain> txt` records.
+  * Checks identifier alignment for both SPF and DKIM against the RFC 5322 `From:` domain.
+  * Enforces `p=reject`, `p=quarantine`, or `p=none`.
+* **Authentication-Results (RFC 8601)**:
+  * Produces standardized authentication headers recording all provenance verdicts.
+* **Dynamic Local Domain (`SmtpLocalDomainRaw`)**:
+  * Dynamically inspects `/net/ndb` for `dom=` or falls back to `/dev/sysname`, completely avoiding hardcoded domain strings.
 
+### 3. `mailfs.o9` (9P Mailbox Filesystem)
+* **AppUser RSA Authentication**: Validates sessions via challenge-response using Plan 9's native `factotum` (`proto=rsa service=appuser app=o9mail role=client`).
+* **Zero-Knowledge Decryption**: Unseals `O9SEAL1` envelopes on-the-fly using the user's Factotum private key via `/mnt/factotum/rpc` and auto-reseals them into the user's unlocked symmetric Vault for instantaneous future access.
+* **Synthetic 9P Tree**:
+  ```text
+  /<session>/view/inbox/index.tab    opaque message identifiers
+  /<session>/view/inbox/select       select message by identifier
+  /<session>/view/inbox/message      selected raw RFC 5322 message
+  /<session>/view/inbox/origin       selected message's origin key
+  /<session>/view/outbox/to          staged recipient address
+  /<session>/view/outbox/subject     staged subject
+  /<session>/view/outbox/body        staged body text
+  /<session>/view/outbox/send        write 'send' to sign and dispatch
+  /<session>/view/outbox/status      status of last send ('sent <mid>' or error)
+  ```
+* **Outbox DKIM Auto-Signing**: Automatically detects domain DKIM keys in `/mail/o9mail/` or `/tmp/`, signs queued mail before transmission, and saves a sealed copy into the sender's encrypted Sent vault.
+
+### 4. `smtpout.o9` (Outbound Delivery Agent)
+* **RFC 5321 Client**: Direct delivery to remote destination MX records or smarthosts.
+* **DNS MX Resolution**: Resolves MX records via native `/net/dns` lookups.
+* **Outbound DKIM Signing**: Signs outbound mail using specified `-k <keyfile>` or auto-discovered domain keys with `-sel <selector>`.
+
+### 5. `o9dkim.o9` (DKIM Keypair Generator)
+* Generates 2048-bit RSA keypairs using `rsagen(2048, 18, 0)` ($e=65537$).
+* Writes factotum-compatible private key files.
+* Outputs ready-to-publish DNS TXT records for DKIM (`<selector>._domainkey.<domain>`), SPF, and DMARC.
+
+### 6. `enroll.o9` (Recipient Enrollment)
+* Enrolls trusted recipient AppUser RSA public keys into the Tabula schema (`trusted_keys.tab`).
+
+---
+
+## Building and Compiling
+
+Requires `o9c` (Objective-9c compiler) on Linux or Plan 9.
+
+### Step 1: Compile `.o9` to C
+```bash
+/path/to/o9c -I/path/to/o9mail smtpd.o9 > smtpd.c
+/path/to/o9c -I/path/to/o9mail smtpout.o9 > smtpout.c
+/path/to/o9c -I/path/to/o9mail mailfs.o9 > mailfs.c
+/path/to/o9c -I/path/to/o9mail o9dkim.o9 > o9dkim.c
+```
+
+### Step 2: Build on 9front
+On 9front (with native Plan 9 libraries):
 ```rc
-view=/n/o9mail/0/view
-echo imaps > $view/account/protocol
-echo mail.example.com > $view/account/host
-echo alice@example.com > $view/account/user
-echo INBOX > $view/account/folder
-echo save > $view/account/save
-cat $view/account/current.tab
+6c -FV -I/usr/scott/include -o smtpd.6 smtpd.c
+6l -o smtpd smtpd.6 /usr/scott/lib/o9/libo9.a /amd64/lib/libndb.a
+
+6c -FV -I/usr/scott/include -o smtpout.6 smtpout.c
+6l -o smtpout smtpout.6 /usr/scott/lib/o9/libo9.a /amd64/lib/libndb.a
+
+6c -FV -I/usr/scott/include -o mailfs.6 mailfs.c
+6l -o mailfs mailfs.6 /usr/scott/lib/o9/libo9.a /amd64/lib/libndb.a
+
+6c -FV -I/usr/scott/include -o o9dkim.6 o9dkim.c
+6l -o o9dkim o9dkim.6 /usr/scott/lib/o9/libo9.a /amd64/lib/libndb.a
 ```
 
-The account record contains no password. UPAS reads the matching
-`proto=pass service=imap server=<host> user=<login>` key from the user's
-factotum. Run `upas/fs` in that factotum namespace, with plumbing disabled,
-then import through the authenticated view:
+---
 
+## Quickstart & Operational Guide
+
+### 1. Generate DKIM Keypair and DNS Records
 ```rc
-upas/fs -n -p -m /mail/fs
-upas-sync sync $view /mail/fs mail.example.com
+o9dkim genkey mydomain.org 2026 /mail/o9mail/dkim_mydomain.org.key
 ```
+This generates the private key and displays the exact DNS records to publish:
+* **DKIM**: `2026._domainkey.mydomain.org IN TXT "v=DKIM1; k=rsa; p=..."`
+* **SPF**: `mydomain.org IN TXT "v=spf1 mx a -all"`
+* **DMARC**: `_dmarc.mydomain.org IN TXT "v=DMARC1; p=reject; rua=mailto:postmaster@mydomain.org"`
 
-The final argument is the host you expect. `upas-sync` rejects a different
-host in the account file. It requires a usable `/sys/lib/tls/mail` certificate
-pin set before opening an IMAPS connection; 9front's UPAS TLS wrapper can
-otherwise proceed without certificate verification. The optional fifth
-argument names an already-open UPAS mailbox and imports from it without
-starting a connection, for example a local test mailbox.
-
-The importer reads at most the newest 128 UPAS message directories, skips
-empty or oversized messages, and uses each message's UPAS digest plus the
-account identity for encrypted deduplication. It does not delete remote mail.
-The normal importer keeps a mailbox open in the supplied `upas/fs` instance.
-Its name is derived from the host, login, and folder so later syncs can
-refresh and reuse it without mixing accounts. Run a dedicated `upas/fs` for
-this account and restart it after changing the account settings.
-Sync is currently an explicit command; a scheduled worker and multiple
-accounts per user remain to be built.
-
-## Build
-
-Requires Objective-9C main at or after commit `91ed8d6`, including
-`serveAppUsers`, the binary-safe `Vault.open`, and the stock factotum RSA
-provider. On 9front with
-`o9build` installed and the Objective-9C stdlib bound into the source tree:
-
+### 2. Enroll Recipients
+Create the trusted keys table and enroll authorized mailbox recipients:
 ```rc
-o9build mailfs.o9
-o9build enroll.o9
-o9build respond.o9
-o9build upas-sync.o9
+cat <<! > /mail/o9mail/trusted_keys.tab
+schema=o9mail_keys_v1
+	col=id
+	col=modulus
+	col=exponent
+
+id=alice
+	modulus=FFD5E35075...
+	exponent=10001
+!
 ```
 
-`mailfs` takes a service name, a private mailbox root, and a trusted enrollment
-table. The private root must be owned by the service user and inaccessible to
-group and other users. The enrollment table is generated by `enroll.o9`
-for one principal, or by any trusted local tabula writer using schema
-`o9mail_keys_v1` and columns `id,modulus,exponent`.
-
+### 3. Start the Inbound SMTP Daemon
 ```rc
-mailfs o9mail /mail/o9mail /lib/o9mail/keys.tab
+smtpd tcp!*!25 mydomain.org /mail/o9mail/trusted_keys.tab /usr/scott/mail/o9mail /tmp/o9spool &
 ```
 
-An authenticated client allocates a session with `clone`, writes
-`auth <principal>` to its `ctl`, signs `challenge.tab` through
-`respond.o9`, and writes the result to `response.tab`. See
-Objective-9C's `docs/APPUSER.md` for the full exchange.
-
-The disposable VM check is:
-
-```sh
-O9_ROOT=/path/to/objective-9c \
-  python3 test/test_mailfs_qemu.py /path/to/9front.img
+### 4. Start the 9P Mailbox Service
+```rc
+mailfs mailfs /usr/scott/mail/o9mail /mail/o9mail/trusted_keys.tab 127.0.0.1 25 mydomain.org &
 ```
 
-Set `O9_ROOT` to a current Objective-9C checkout and `HALATHA_ROOT` if the
-Halatha checkout is outside the sibling directory. This test starts a
-disposable TLS IMAP server on the host and forwards the VM's IMAPS port to it
-through QEMU. It checks two live network imports and a repeated sync, in
-addition to the local UPAS fixture. The server implements the IMAP commands
-used by UPAS for this test; no real mailbox credentials are used.
+### 5. Read and Send Email via 9P
+Mount the mailbox filesystem inside your authenticated session:
+```rc
+# Load private key into factotum
+cat /usr/scott/keyring/alice.key > /mnt/factotum/ctl
 
-## Security boundary
+# Mount synthetic filesystem
+mount /srv/mailfs /mail
 
-AppUser authenticates a principal; it does not encrypt the 9P transport.
-Only mount this service locally or over a separately protected channel.
-Writing a passphrase to `unlock` over cleartext 9P would expose it. Keep the
-enrollment table under operator control; public self-enrollment would defeat
-the gate. The service does not call `Vault.openTab`, because that helper
-currently writes a temporary plaintext `.tab` file.
+# Unlock your private symmetric vault
+sid=`{cat /mail/clone}
+# ... perform challenge-response authentication with /mail/$sid/ctl ...
+echo 'my-passphrase' > /mail/$sid/view/unlock
 
-After a daemon restart, every mailbox is locked. The importer runs only with
-an unlocked authenticated view and cannot pull unattended after a restart.
-There is no server escrow. See [docs/DESIGN.md](docs/DESIGN.md) for the
-delivery design and limits.
+# Read inbound mail
+cat /mail/$sid/view/inbox/index.tab
+echo '<mid>' > /mail/$sid/view/inbox/select
+cat /mail/$sid/view/inbox/message
+
+# Send signed mail
+echo -n 'recipient@remote.com' > /mail/$sid/view/outbox/to
+echo -n 'Subject line' > /mail/$sid/view/outbox/subject
+echo 'Hello from 9front!' > /mail/$sid/view/outbox/body
+echo send > /mail/$sid/view/outbox/send
+cat /mail/$sid/view/outbox/status
+```
+
+---
+
+## Verification & Testing
+
+A complete automated unit and integration suite is included:
+* **`test_sec.o9`**: Verifies DKIM RSA signing, verification, relaxed canonicalization, SPF resolution, and DMARC alignment.
+* **`test_mailfs_dkim.rc`**: Full end-to-end integration test validating Factotum challenge-response authentication, 9P outbox staging, DKIM auto-signing, SMTP receipt, DMARC policy check, and zero-knowledge vault sealing.
+
+---
+
+## License
+
+BSD 3-Clause. Designed and built for Plan 9 and 9front.
