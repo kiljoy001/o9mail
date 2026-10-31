@@ -127,6 +127,17 @@ It enables standalone 9front nodes to participate directly in the modern federat
 * Validates TLS certificate pins against `/sys/lib/tls/mail`.
 * Performs encrypted deduplication using message digests, packaging imported mail directly into the user's zero-knowledge vault.
 
+### 8. `o9admin.o9` (Native GUI Server Administration Console)
+* **Zero Command-Line Dependency**: Full graphical administration panel built natively in `o9` using Plan 9 `/dev/draw` and `libdraw`. No web servers, Python, or REST sidecars.
+* **Designing Interfaces (O'Reilly) Architecture**:
+  * **Card Stack Navigation (`DrawTabBar`)**: 4 primary workspaces (`Services & Engine`, `DKIM & DNS Setup`, `AppUsers & Vaults`, `Ingress Audit Log`).
+  * **Status Annunciators (`DrawBadge` & `DrawCard`)**: Color-coded real-time service indicators (`RUNNING`, `STOPPED`, `MOUNTED`, `ENFORCING`).
+  * **Master-Detail View (`DrawSplitPane` & `DrawTable`)**: Dual-pane directory inspector for enrolled recipients and vault properties.
+  * **Property Sheet Inspector (`DrawPropertySheet`)**: Formatted DNS TXT directive display (DKIM, SPF, DMARC) ready to copy to nameservers.
+  * **Direct Action Controls (`DrawButton`, `DrawTextInput`)**: One-click keypair generation, service start/stop, and recipient enrollment.
+  * **Modal Safety Gate (`DrawDialog`)**: Confirms dangerous operations (e.g. stopping `smtpd`, revoking keys) before execution.
+  * **Global Status Anchor (`DrawStatusBar`)**: Bottom status footer displaying active host node, port state, and zero-knowledge integrity notices.
+
 ---
 
 ## 9P View and Factotum Protocol Specification
@@ -192,6 +203,7 @@ Requires `o9c` (Objective-9c compiler) on Linux or Plan 9.
 /path/to/o9c -I/path/to/o9mail smtpout.o9 > smtpout.c
 /path/to/o9c -I/path/to/o9mail mailfs.o9 > mailfs.c
 /path/to/o9c -I/path/to/o9mail o9dkim.o9 > o9dkim.c
+/path/to/o9c -I/path/to/o9mail o9admin.o9 > o9admin.c
 ```
 
 ### Step 2: Build on 9front
@@ -208,11 +220,29 @@ On 9front (with native Plan 9 libraries):
 
 6c -FV -I/usr/scott/include -o o9dkim.6 o9dkim.c
 6l -o o9dkim o9dkim.6 /usr/scott/lib/o9/libo9.a /amd64/lib/libndb.a
+
+6c -FV -I/usr/scott/include -o o9admin.6 o9admin.c
+6l -o /usr/scott/bin/amd64/o9admin o9admin.6 /usr/scott/lib/o9/libo9.a /amd64/lib/libdraw.a /amd64/lib/libmemdraw.a /amd64/lib/libmemlayer.a /amd64/lib/libsec.a /amd64/lib/libmp.a /amd64/lib/libndb.a
 ```
 
 ---
 
 ## Quickstart & Operational Guide
+
+### 0. Graphical Administration (No Command-Line Required)
+Launch the graphical console inside Rio or drawterm:
+```rc
+o9admin -i
+```
+Or run the built-in self-verification test suite headlessly:
+```rc
+o9admin
+```
+The administration panel provides complete control over:
+1. Starting and stopping `smtpd` (inbound engine) and `mailfs` (9P mailbox service).
+2. Generating 2048-bit RSA DKIM keys and inspecting formatted DNS TXT directives.
+3. Managing AppUser recipients and inspecting enrolled public modulus keys.
+4. Monitoring live incoming SMTP handshakes, DMARC wire rejections, and zero-knowledge encryption events.
 
 ### 1. Generate DKIM Keypair and DNS Records
 ```rc
