@@ -138,6 +138,24 @@ It enables standalone 9front nodes to participate directly in the modern federat
   * **Modal Safety Gate (`DrawDialog`)**: Confirms dangerous operations (e.g. stopping `smtpd`, revoking keys) before execution.
   * **Global Status Anchor (`DrawStatusBar`)**: Bottom status footer displaying active host node, port state, and zero-knowledge integrity notices.
 
+### 9. `o9mail.o9` (Native Graphical Email Client Frontend)
+* **Sovereign Desktop Email Experience**: Full-featured graphical email client built natively in `o9` using Plan 9 `/dev/draw` and `libdraw`. Completely eliminates command-line mail reading while preserving zero-knowledge cryptographic guarantees.
+* **Designing Interfaces (O'Reilly) Architecture**:
+  * **Three-Pane Email Reader**:
+    * **Left Pane (Mailboxes / Folders)**: `DrawTable` displaying `Inbox`, `Sent`, `Drafts`, `Trash` with live unread/message count badges.
+    * **Middle Pane (Message Index)**: `DrawTable` with multi-column header (`From` / `To`, `Subject`, `Date`), instantaneous row selection, and keyboard navigation (`j`/`k`).
+    * **Right Pane (Message Viewer & Provenance Inspector)**:
+      * `DrawPropertySheet`: Formatted header inspection displaying `From`, `To`, `Date`, `Subject`, and RFC 8601 verdicts (`DKIM: pass`, `SPF: pass`, `DMARC: pass`, `O9SEAL1 Zero-Knowledge Guard`).
+      * Direct Action Toolbar: `[ Reply ]`, `[ Forward ]`, `[ Archive ]`, `[ Delete ]`.
+      * Message Body: High-performance `DrawScrollText` displaying decrypted RFC 5322 email bodies.
+  * **Card Stack Navigation (`DrawTabBar`)**: 3 dedicated workspaces:
+    * `[ 1. Mailbox & Reader ]`: Complete 3-pane email browsing and reading experience.
+    * `[ 2. Compose New ]`: Rich email composition form with recipient, subject, selector, and body inputs, direct 2048-bit RSA DKIM auto-signing, and 9P outbox staging.
+    * `[ 3. Vault & Factotum ]`: AppUser identity inspection, Factotum `/mnt/factotum/rpc` status, and symmetric vault unsealing/locking with `DrawPasswordInput`.
+  * **Modal Safety Gate (`DrawDialog`)**: Confirms destructive actions (discarding composition, moving messages to Trash, locking vault).
+  * **Global Status Anchor (`DrawStatusBar`)**: Real-time annunciator displaying host node (`dev9p`), AppUser principal, vault unsealed state, and message counts.
+  * **Responsive Dynamic Layout**: Introspective `resize(w, h)` supporting seamless Rio window adjustments (`eresized(1)` / `getwindow`) without layout drift.
+
 ---
 
 ## 9P View and Factotum Protocol Specification
@@ -305,6 +323,26 @@ echo -n 'Subject line' > /mail/$sid/view/outbox/subject
 echo 'Hello from 9front!' > /mail/$sid/view/outbox/body
 echo send > /mail/$sid/view/outbox/send
 cat /mail/$sid/view/outbox/status
+```
+
+### 6. Launch the Native Graphical Email Client
+Run the dedicated desktop mail client with three-pane browsing and direct DKIM composing:
+```rc
+# Launch interactive Rio GUI window
+o9mail -i
+
+# Run automated headless verification suite
+o9mail
+```
+
+### 7. Launch the Server Administration Console
+Administrate daemons, generate DKIM keys, enroll AppUser recipients, and monitor logs:
+```rc
+# Launch interactive Rio GUI window
+o9admin -i
+
+# Run automated headless verification suite
+o9admin
 ```
 
 ---

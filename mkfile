@@ -27,8 +27,8 @@ o9dkim: o9dkim.$O
 o9admin: o9admin.$O
 	$LD -o $target $prereq /usr/scott/lib/o9/libo9.a /amd64/lib/libdraw.a /amd64/lib/libmemdraw.a /amd64/lib/libmemlayer.a /amd64/lib/libsec.a /amd64/lib/libmp.a /amd64/lib/libndb.a
 
-o9mail: o9admin
-	cp o9admin o9mail
+o9mail: o9mail.$O
+	$LD -o $target $prereq /usr/scott/lib/o9/libo9.a /amd64/lib/libdraw.a /amd64/lib/libmemdraw.a /amd64/lib/libmemlayer.a /amd64/lib/libsec.a /amd64/lib/libmp.a /amd64/lib/libndb.a
 
 install:V: all
 	cp $TARG $BIN/
