@@ -224,6 +224,7 @@ class O9AdminApp {
     prop DrawTextInput inputEnrollModulus;
     prop DrawButton btnEnroll;
     prop DrawButton btnRevoke;
+    prop string[] userModuli;
 
     // Tab 3: Ingress Audit
     prop DrawCard cardAudit;
@@ -324,14 +325,13 @@ class O9AdminApp {
         tableUsers.setCell(2, 1, "2048b");
         tableUsers.setCell(2, 2, "Sealed (0600)");
 
+        userModuli[0] = "FFD5E35075A6C8...";
+        userModuli[1] = "A89271BC459D01...";
+        userModuli[2] = "E23908BA1425FF...";
+
         sheetUser = new DrawPropertySheet(330, 56, 530, 200);
-        sheetUser.addProperty("Selected User", "alice");
-        sheetUser.addProperty("Role", "Mailbox Recipient");
-        sheetUser.addProperty("Modulus", "FFD5E35075A6C8...");
-        sheetUser.addProperty("Exponent", "10001 (65537)");
-        sheetUser.addProperty("Vault Path", "/usr/scott/mail/o9mail/alice");
-        sheetUser.addProperty("Encryption", "Monocypher XChaCha20-Poly1305");
-        sheetUser.addProperty("Factotum RPC", "/mnt/factotum/rpc app=o9mail");
+        tableUsers.select(0);
+        selectUser(0);
 
         inputEnrollUser = new DrawTextInput("newuser", 330, 270, 160, 24);
         inputEnrollModulus = new DrawTextInput("FFD5E35075...", 500, 270, 240, 24);
@@ -490,15 +490,42 @@ class O9AdminApp {
         }
     }
 
+    method void selectUser(int64 row) {
+        if(row >= 0 && row < tableUsers.rows()) {
+            string u = tableUsers.cell(row, 0);
+            string ksz = tableUsers.cell(row, 1);
+            string vstat = tableUsers.cell(row, 2);
+            string mod = userModuli[row];
+            if(len(mod) == 0) {
+                mod = "FFD5E35075A6C8...";
+            }
+
+            sheetUser.clear();
+            sheetUser.addProperty("Selected User", u);
+            sheetUser.addProperty("Role", "Mailbox Recipient");
+            sheetUser.addProperty("Key Size", ksz);
+            sheetUser.addProperty("Vault Status", vstat);
+            sheetUser.addProperty("Modulus", mod);
+            sheetUser.addProperty("Exponent", "10001 (65537)");
+            sheetUser.addProperty("Vault Path", cat("/usr/scott/mail/o9mail/", u));
+            sheetUser.addProperty("Encryption", "Monocypher XChaCha20-Poly1305");
+            sheetUser.addProperty("Factotum RPC", "/mnt/factotum/rpc app=o9mail");
+
+            inputEnrollUser.setText(u);
+            inputEnrollModulus.setText(mod);
+            statusBar.setNotice(cat("Selected AppUser: ", u));
+        }
+    }
+
     method void enrollUser(string user, string modulus) {
-        inputEnrollUser.setText(user);
-        inputEnrollModulus.setText(modulus);
         int64 curRows = tableUsers.rows();
         tableUsers.setRows(curRows + 1);
         tableUsers.setCell(curRows, 0, user);
         tableUsers.setCell(curRows, 1, "2048b");
         tableUsers.setCell(curRows, 2, "Sealed (0600)");
-        sheetUser.addProperty("Enrolled User", user);
+        userModuli[curRows] = modulus;
+        tableUsers.select(curRows);
+        selectUser(curRows);
         statusBar.setNotice(cat("AppUser recipient enrolled: ", user));
     }
 
@@ -685,7 +712,11 @@ class O9AdminApp {
 
         // Tab 2 AppUser clicks
         if(currentTab == 2) {
-            tableUsers.handleMouse(x, y, buttons);
+            if(tableUsers.handleMouse(x, y, buttons)) {
+                int64 sel = tableUsers.selectedRow();
+                selectUser(sel);
+                return true;
+            }
             inputEnrollUser.handleMouse(x, y, buttons);
             inputEnrollModulus.handleMouse(x, y, buttons);
 
@@ -699,7 +730,12 @@ class O9AdminApp {
             }
 
             if(btnRevoke.handleMouse(x, y, buttons)) {
-                confirmDlg.show("Revoke Recipient", "Revoke user public key from trusted_keys.tab?");
+                int64 r = tableUsers.selectedRow();
+                string u = "user";
+                if(r >= 0 && r < tableUsers.rows()) {
+                    u = tableUsers.cell(r, 0);
+                }
+                confirmDlg.show("Revoke Recipient", cat("Revoke user '", cat(u, "' from trusted_keys.tab?")));
                 return true;
             }
         }
@@ -737,6 +773,13 @@ class O9AdminApp {
         }
 
         if(currentTab == 2) {
+            if(tableUsers.focused()) {
+                if(tableUsers.handleKey(key)) {
+                    int64 sel = tableUsers.selectedRow();
+                    selectUser(sel);
+                    return true;
+                }
+            }
             if(inputEnrollUser.focused()) {
                 inputEnrollUser.handleKey(key);
                 return true;
@@ -801,10 +844,15 @@ main {
     app.clickConfirmOk();
     print("Modal action confirmed. Current notice: ", app.currentNotice(), "\n");
 
-    // Test AppUser enrollment form
+    // Test AppUser enrollment form & selection
     app.switchTab(2);
     app.enrollUser("charlie", "A1B2C3D4E5F6");
     print("AppUser enrolled. Row count=", app.tableRows(), "\n");
+
+    app.selectUser(1); // Select bob
+    print("Selected user 1: notice=", app.currentNotice(), "\n");
+    app.selectUser(0); // Select alice
+    print("Selected user 0: notice=", app.currentNotice(), "\n");
 
     // Test DKIM Generation
     app.switchTab(1);
