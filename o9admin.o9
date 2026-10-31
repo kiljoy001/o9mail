@@ -308,9 +308,9 @@ class O9AdminApp {
         sheetDns.addProperty("DNS Status", "Ready to publish to nameserver");
 
         // 5. Tab 2: AppUsers & Vaults (Master-Detail)
-        splitUsers = new DrawSplitPane(20, 56, 840, 390, 320);
+        splitUsers = new DrawSplitPane(20, 56, 840, 390, 300);
 
-        tableUsers = new DrawTable(20, 56, 310, 390, 3, 3);
+        tableUsers = new DrawTable(20, 56, 300, 390, 3, 3);
         tableUsers.setHeader(0, "Principal");
         tableUsers.setHeader(1, "Key Size");
         tableUsers.setHeader(2, "Vault Status");
@@ -324,7 +324,7 @@ class O9AdminApp {
         tableUsers.setCell(2, 1, "2048b");
         tableUsers.setCell(2, 2, "Sealed (0600)");
 
-        sheetUser = new DrawPropertySheet(340, 56, 520, 240);
+        sheetUser = new DrawPropertySheet(330, 56, 530, 200);
         sheetUser.addProperty("Selected User", "alice");
         sheetUser.addProperty("Role", "Mailbox Recipient");
         sheetUser.addProperty("Modulus", "FFD5E35075A6C8...");
@@ -333,11 +333,11 @@ class O9AdminApp {
         sheetUser.addProperty("Encryption", "Monocypher XChaCha20-Poly1305");
         sheetUser.addProperty("Factotum RPC", "/mnt/factotum/rpc app=o9mail");
 
-        inputEnrollUser = new DrawTextInput("newuser", 340, 310, 160, 24);
-        inputEnrollModulus = new DrawTextInput("FFD5E35075...", 510, 310, 220, 24);
-        btnEnroll = new DrawButton("Enroll User", 340, 350, 120, 24);
+        inputEnrollUser = new DrawTextInput("newuser", 330, 270, 160, 24);
+        inputEnrollModulus = new DrawTextInput("FFD5E35075...", 500, 270, 240, 24);
+        btnEnroll = new DrawButton("Enroll User", 330, 306, 120, 26);
         btnEnroll.color(0x047857, 0xf8fafc);
-        btnRevoke = new DrawButton("Revoke User", 480, 350, 120, 24);
+        btnRevoke = new DrawButton("Revoke User", 460, 306, 120, 26);
         btnRevoke.color(0x991b1b, 0xf8fafc);
 
         // 6. Tab 3: Ingress Audit Log
@@ -421,28 +421,29 @@ class O9AdminApp {
             splitH = 200;
         }
         splitUsers.bounds(20, 56, fullW, splitH);
-        int64 leftW = fullW / 3;
-        if(leftW < 220) {
-            leftW = 220;
+        int64 leftW = 300;
+        if(leftW > fullW - 240) {
+            leftW = fullW - 240;
+        }
+        if(leftW < 180) {
+            leftW = 180;
         }
         splitUsers.setSplit(leftW);
         tableUsers.bounds(20, 56, leftW, splitH);
 
         int64 rightX = 30 + leftW;
         int64 rightW = fullW - leftW - 10;
-        int64 sheetH = splitH - 120;
-        if(sheetH < 100) {
-            sheetH = 100;
-        }
-        sheetUser.bounds(rightX, 56, rightW, sheetH);
-        inputEnrollUser.bounds(rightX, 56 + splitH - 100, 160, 24);
+        sheetUser.bounds(rightX, 56, rightW, 200);
+
+        // Fixed stable form layout docked right below sheetUser
+        inputEnrollUser.bounds(rightX, 270, 160, 24);
         int64 modW = rightW - 180;
-        if(modW < 100) {
-            modW = 100;
+        if(modW < 140) {
+            modW = 140;
         }
-        inputEnrollModulus.bounds(rightX + 170, 56 + splitH - 100, modW, 24);
-        btnEnroll.bounds(rightX, 56 + splitH - 60, 120, 24);
-        btnRevoke.bounds(rightX + 140, 56 + splitH - 60, 120, 24);
+        inputEnrollModulus.bounds(rightX + 170, 270, modW, 24);
+        btnEnroll.bounds(rightX, 306, 120, 26);
+        btnRevoke.bounds(rightX + 130, 306, 120, 26);
 
         // 6. Tab 3: Ingress Audit Log
         int64 auditH = h - 110;
