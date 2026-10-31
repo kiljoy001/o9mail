@@ -365,6 +365,119 @@ class O9AdminApp {
         }
     }
 
+    method void resize(int64 newW, int64 newH) {
+        if(newW < 400) {
+            newW = 400;
+        }
+        if(newH < 300) {
+            newH = 300;
+        }
+        w = newW;
+        h = newH;
+
+        // 1. Navigation Tab Bar (Top)
+        tabs.bounds(12, 12, w - 24, 32);
+
+        // 2. Status Bar (Bottom)
+        statusBar.bounds(12, h - 36, w - 24, 24);
+
+        // 3. Tab 0: Services
+        int64 halfW = (w - 60) / 2;
+        int64 cardH = (h - 140) / 2;
+        if(cardH < 150) {
+            cardH = 150;
+        }
+
+        cardSmtpd.bounds(20, 56, halfW, cardH);
+        btnStartSmtpd.position(30, 56 + cardH - 36);
+        btnStopSmtpd.position(120, 56 + cardH - 36);
+
+        cardMailfs.bounds(30 + halfW, 56, halfW, cardH);
+        btnMountMailfs.position(40 + halfW, 56 + cardH - 36);
+        btnUnmountMailfs.position(130 + halfW, 56 + cardH - 36);
+
+        int64 row2Y = 66 + cardH;
+        cardSec.bounds(20, row2Y, halfW, cardH);
+        cardVault.bounds(30 + halfW, row2Y, halfW, cardH);
+        progressStorage.bounds(30 + halfW, row2Y + cardH - 30, halfW, 20);
+
+        // 4. Tab 1: DKIM & DNS Setup
+        int64 fullW = w - 40;
+        cardDkimGen.bounds(20, 56, fullW, 190);
+        int64 keyPathW = fullW - 440;
+        if(keyPathW < 120) {
+            keyPathW = 120;
+        }
+        inputKeyPath.bounds(420, 130, keyPathW, 24);
+        int64 dnsH = h - 310;
+        if(dnsH < 120) {
+            dnsH = 120;
+        }
+        sheetDns.bounds(20, 260, fullW, dnsH);
+
+        // 5. Tab 2: AppUsers & Vaults (Master-Detail)
+        int64 splitH = h - 110;
+        if(splitH < 200) {
+            splitH = 200;
+        }
+        splitUsers.bounds(20, 56, fullW, splitH);
+        int64 leftW = fullW / 3;
+        if(leftW < 220) {
+            leftW = 220;
+        }
+        splitUsers.setSplit(leftW);
+        tableUsers.bounds(20, 56, leftW, splitH);
+
+        int64 rightX = 30 + leftW;
+        int64 rightW = fullW - leftW - 10;
+        int64 sheetH = splitH - 120;
+        if(sheetH < 100) {
+            sheetH = 100;
+        }
+        sheetUser.bounds(rightX, 56, rightW, sheetH);
+        inputEnrollUser.bounds(rightX, 56 + splitH - 100, 160, 24);
+        int64 modW = rightW - 180;
+        if(modW < 100) {
+            modW = 100;
+        }
+        inputEnrollModulus.bounds(rightX + 170, 56 + splitH - 100, modW, 24);
+        btnEnroll.bounds(rightX, 56 + splitH - 60, 120, 24);
+        btnRevoke.bounds(rightX + 140, 56 + splitH - 60, 120, 24);
+
+        // 6. Tab 3: Ingress Audit Log
+        int64 auditH = h - 110;
+        if(auditH < 200) {
+            auditH = 200;
+        }
+        cardAudit.bounds(20, 56, fullW, auditH);
+        int64 logH = h - 230;
+        if(logH < 100) {
+            logH = 100;
+        }
+        auditLog.bounds(40, 120, fullW - 40, logH);
+        btnRefreshLog.position(40, h - 90);
+        btnClearLog.position(200, h - 90);
+
+        // 7. Modal Confirmation Dialog (Centered)
+        int64 dlgW = 400;
+        int64 dlgH = 180;
+        if(dlgW > w - 40) {
+            dlgW = w - 40;
+        }
+        if(dlgH > h - 40) {
+            dlgH = h - 40;
+        }
+        confirmDlg.bounds((w - dlgW) / 2, (h - dlgH) / 2, dlgW, dlgH);
+    }
+
+    method int64 appWidth() {
+        return w;
+    }
+
+    method int64 appHeight() {
+        return h;
+    }
+
     method int64 activeTab() {
         return currentTab;
     }
@@ -702,6 +815,13 @@ main {
     app.refreshAuditLog();
     print("Audit log length=", app.auditTextLength(), "\n");
 
+    // Test Responsive Dynamic Layout Resizing
+    app.resize(1024, 768);
+    frame.reset(0x0f172a);
+    app.drawFrame(frame);
+    print("Resized to 1024x768 render pass complete: commands=", frame.count(), " w=", app.appWidth(), " h=", app.appHeight(), "\n");
+
+    app.resize(880, 560);
     frame.reset(0x0f172a);
     app.drawFrame(frame);
     print("Final comprehensive frame flush: commands=", frame.count(), "\n");
@@ -710,8 +830,15 @@ main {
         print("Launching live interactive Rio window...\n");
         DrawWindow win = new DrawWindow("o9mail Server Administration", 880, 560);
         if(win.open()) {
+            int64 initW = win.width();
+            int64 initH = win.height();
+            if(initW > 0 && initH > 0) {
+                app.resize(initW, initH);
+            }
+
             bool running = true;
             while(running) {
+                frame.reset(0x0f172a);
                 app.drawFrame(frame);
                 DrawCanvas c = win.canvas();
                 frame.flush(c);
@@ -727,6 +854,13 @@ main {
                         running = false;
                     } else {
                         app.handleKey(k);
+                    }
+                }
+                if(ev == 3) { // Window Resize event from Rio / eresized!
+                    int64 nw = win.width();
+                    int64 nh = win.height();
+                    if(nw > 0 && nh > 0) {
+                        app.resize(nw, nh);
                     }
                 }
             }
