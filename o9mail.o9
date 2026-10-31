@@ -900,28 +900,30 @@ class O9MailApp {
     method bool handleMouse(int64 x, int64 y, int64 buttons) {
         // Handle modal dialog overlay first if visible
         if(confirmDlg.visible()) {
-            if(confirmDlg.handleMouse(x, y, buttons)) {
-                if(confirmDlg.dialogResult() == 1) {
-                    if(dlgAction == 1) {
-                        inputTo.setText("");
-                        inputSubject.setText("");
-                        inputBody.setText("");
-                        switchTab(0);
-                        statusBar.setNotice("Draft discarded");
-                    }
-                    if(dlgAction == 2) {
-                        deleteCurrentMessage();
-                    }
-                    if(dlgAction == 3) {
-                        lockVault();
-                    }
-                } else {
-                    statusBar.setNotice("Action cancelled");
+            confirmDlg.handleMouse(x, y, buttons);
+            if(confirmDlg.dialogResult() == 1) {
+                if(dlgAction == 1) {
+                    inputTo.setText("");
+                    inputSubject.setText("");
+                    inputBody.setText("");
+                    switchTab(0);
+                    statusBar.setNotice("Draft discarded");
+                }
+                if(dlgAction == 2) {
+                    deleteCurrentMessage();
+                }
+                if(dlgAction == 3) {
+                    lockVault();
                 }
                 confirmDlg.hide();
                 return true;
             }
-            return false;
+            if(confirmDlg.dialogResult() == 2) {
+                statusBar.setNotice("Action cancelled");
+                confirmDlg.hide();
+                return true;
+            }
+            return true;
         }
 
         // Handle navigation TabBar clicks
@@ -951,22 +953,22 @@ class O9MailApp {
             }
 
             // Reader Action Buttons
-            if(btnReply.handleMouse(x, y, buttons)) {
+            if(btnReply.clicked(x, y, buttons)) {
                 replyCurrentMessage();
                 return true;
             }
 
-            if(btnForward.handleMouse(x, y, buttons)) {
+            if(btnForward.clicked(x, y, buttons)) {
                 forwardCurrentMessage();
                 return true;
             }
 
-            if(btnArchive.handleMouse(x, y, buttons)) {
+            if(btnArchive.clicked(x, y, buttons)) {
                 statusBar.setNotice("Message archived to zero-knowledge vault");
                 return true;
             }
 
-            if(btnDelete.handleMouse(x, y, buttons)) {
+            if(btnDelete.clicked(x, y, buttons)) {
                 dlgAction = 2;
                 confirmDlg.show("Delete Message", "Move this email message to Trash?");
                 return true;
@@ -986,17 +988,17 @@ class O9MailApp {
             inputDkimSel.handleMouse(x, y, buttons);
             inputBody.handleMouse(x, y, buttons);
 
-            if(btnSend.handleMouse(x, y, buttons)) {
+            if(btnSend.clicked(x, y, buttons)) {
                 sendCurrentMessage();
                 return true;
             }
 
-            if(btnSaveDraft.handleMouse(x, y, buttons)) {
+            if(btnSaveDraft.clicked(x, y, buttons)) {
                 statusBar.setNotice("Message draft saved to encrypted storage");
                 return true;
             }
 
-            if(btnDiscard.handleMouse(x, y, buttons)) {
+            if(btnDiscard.clicked(x, y, buttons)) {
                 dlgAction = 1;
                 confirmDlg.show("Discard Draft", "Discard your compose draft?");
                 return true;
@@ -1007,13 +1009,13 @@ class O9MailApp {
         if(currentTab == 2) {
             inputPassphrase.handleMouse(x, y, buttons);
 
-            if(btnUnlockVault.handleMouse(x, y, buttons)) {
+            if(btnUnlockVault.clicked(x, y, buttons)) {
                 string p = inputPassphrase.text();
                 unlockVault(p);
                 return true;
             }
 
-            if(btnLockVault.handleMouse(x, y, buttons)) {
+            if(btnLockVault.clicked(x, y, buttons)) {
                 dlgAction = 3;
                 confirmDlg.show("Lock Vault", "Clear ephemeral keys and lock symmetric vault?");
                 return true;
@@ -1036,6 +1038,11 @@ class O9MailApp {
                     loadMessage(visibleMsgIndices[selRow]);
                 }
                 return true;
+            }
+            if(textBody.focused()) {
+                if(textBody.handleKey(key)) {
+                    return true;
+                }
             }
         }
 
@@ -1135,7 +1142,7 @@ main {
 
     // 7. Test Modal Confirmation Dialog
     app.switchTab(1);
-    app.handleMouse(274, 560 - 36, 1); // Click Discard button
+    app.handleMouse(280, 495, 1); // Click Discard button (x=280, y=495)
     frame.reset(0x0f172a);
     app.drawFrame(frame);
     print("Modal dialog rendered: commands=", frame.count(), "\n");

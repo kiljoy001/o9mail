@@ -225,6 +225,7 @@ class O9AdminApp {
     prop DrawButton btnEnroll;
     prop DrawButton btnRevoke;
     prop string[] userModuli;
+    prop int64 dlgAction;
 
     // Tab 3: Ingress Audit
     prop DrawCard cardAudit;
@@ -239,6 +240,7 @@ class O9AdminApp {
         w = width;
         h = height;
         currentTab = 0;
+        dlgAction = 0;
         statusNotice = "Zero-Knowledge Sealed (0 plaintext leaks)";
 
         // 1. Navigation Tab Bar (Top)
@@ -483,10 +485,40 @@ class O9AdminApp {
         return currentTab;
     }
 
+    method void revokeSelectedUser() {
+        int64 sel = tableUsers.selectedRow();
+        int64 total = tableUsers.rows();
+        if(sel >= 0 && sel < total && total > 1) {
+            string u = tableUsers.cell(sel, 0);
+            int64 i = sel;
+            while(i < total - 1) {
+                tableUsers.setCell(i, 0, tableUsers.cell(i + 1, 0));
+                tableUsers.setCell(i, 1, tableUsers.cell(i + 1, 1));
+                tableUsers.setCell(i, 2, tableUsers.cell(i + 1, 2));
+                userModuli[i] = userModuli[i + 1];
+                i = i + 1;
+            }
+            tableUsers.setRows(total - 1);
+            if(sel >= total - 1) {
+                sel = total - 2;
+            }
+            tableUsers.select(sel);
+            selectUser(sel);
+            statusBar.setNotice(cat("Revoked recipient from trusted_keys.tab: ", u));
+        }
+    }
+
     method void clickConfirmOk() {
         if(confirmDlg.visible()) {
             confirmDlg.clickOk();
-            statusBar.setNotice("Action confirmed by administrator");
+            if(dlgAction == 1) {
+                cardSmtpd.setBadge("STOPPED", 0x7f1d1d, 0xf87171, 0xb91c1c);
+                statusBar.setNotice("smtpd service stopped by administrator");
+            }
+            if(dlgAction == 2) {
+                revokeSelectedUser();
+            }
+            confirmDlg.hide();
         }
     }
 
@@ -647,16 +679,24 @@ class O9AdminApp {
     method bool handleMouse(int64 x, int64 y, int64 buttons) {
         // Check dialog first if open
         if(confirmDlg.visible()) {
-            if(confirmDlg.handleMouse(x, y, buttons)) {
-                if(confirmDlg.dialogResult() == 1) {
-                    statusBar.setNotice("Action confirmed by administrator");
-                } else {
-                    statusBar.setNotice("Action cancelled");
+            confirmDlg.handleMouse(x, y, buttons);
+            if(confirmDlg.dialogResult() == 1) {
+                if(dlgAction == 1) {
+                    cardSmtpd.setBadge("STOPPED", 0x7f1d1d, 0xf87171, 0xb91c1c);
+                    statusBar.setNotice("smtpd service stopped by administrator");
+                }
+                if(dlgAction == 2) {
+                    revokeSelectedUser();
                 }
                 confirmDlg.hide();
                 return true;
             }
-            return false;
+            if(confirmDlg.dialogResult() == 2) {
+                statusBar.setNotice("Action cancelled");
+                confirmDlg.hide();
+                return true;
+            }
+            return true;
         }
 
         // Handle navigation tab clicks
@@ -667,21 +707,22 @@ class O9AdminApp {
 
         // Tab 0 button clicks
         if(currentTab == 0) {
-            if(btnStartSmtpd.handleMouse(x, y, buttons)) {
+            if(btnStartSmtpd.clicked(x, y, buttons)) {
                 statusBar.setNotice("Starting smtpd on tcp!*!2525...");
                 cardSmtpd.setBadge("RUNNING", 0x064e3b, 0x34d399, 0x059669);
                 return true;
             }
-            if(btnStopSmtpd.handleMouse(x, y, buttons)) {
+            if(btnStopSmtpd.clicked(x, y, buttons)) {
+                dlgAction = 1;
                 confirmDlg.show("Stop smtpd Service", "Stopping smtpd will pause inbound email receipt. Proceed?");
                 return true;
             }
-            if(btnMountMailfs.handleMouse(x, y, buttons)) {
+            if(btnMountMailfs.clicked(x, y, buttons)) {
                 statusBar.setNotice("Posting /srv/mailfs...");
                 cardMailfs.setBadge("MOUNTED", 0x064e3b, 0x34d399, 0x059669);
                 return true;
             }
-            if(btnUnmountMailfs.handleMouse(x, y, buttons)) {
+            if(btnUnmountMailfs.clicked(x, y, buttons)) {
                 statusBar.setNotice("Unmounting /srv/mailfs and locking vaults...");
                 cardMailfs.setBadge("STOPPED", 0x334155, 0x94a3b8, 0x475569);
                 return true;
@@ -694,7 +735,7 @@ class O9AdminApp {
             inputSelector.handleMouse(x, y, buttons);
             inputKeyPath.handleMouse(x, y, buttons);
 
-            if(btnGenDkim.handleMouse(x, y, buttons)) {
+            if(btnGenDkim.clicked(x, y, buttons)) {
                 string dom = inputDomain.text();
                 string sel = inputSelector.text();
                 string kp = inputKeyPath.text();
@@ -720,7 +761,7 @@ class O9AdminApp {
             inputEnrollUser.handleMouse(x, y, buttons);
             inputEnrollModulus.handleMouse(x, y, buttons);
 
-            if(btnEnroll.handleMouse(x, y, buttons)) {
+            if(btnEnroll.clicked(x, y, buttons)) {
                 string u = inputEnrollUser.text();
                 string m = inputEnrollModulus.text();
                 if(len(u) > 0) {
@@ -729,7 +770,8 @@ class O9AdminApp {
                 return true;
             }
 
-            if(btnRevoke.handleMouse(x, y, buttons)) {
+            if(btnRevoke.clicked(x, y, buttons)) {
+                dlgAction = 2;
                 int64 r = tableUsers.selectedRow();
                 string u = "user";
                 if(r >= 0 && r < tableUsers.rows()) {
@@ -742,13 +784,16 @@ class O9AdminApp {
 
         // Tab 3 Log clicks
         if(currentTab == 3) {
-            if(btnRefreshLog.handleMouse(x, y, buttons)) {
+            if(btnRefreshLog.clicked(x, y, buttons)) {
                 refreshAuditLog();
                 return true;
             }
-            if(btnClearLog.handleMouse(x, y, buttons)) {
+            if(btnClearLog.clicked(x, y, buttons)) {
                 auditLog.setText("");
                 statusBar.setNotice("Audit log display cleared");
+                return true;
+            }
+            if(auditLog.handleMouse(x, y, buttons)) {
                 return true;
             }
         }
@@ -786,6 +831,12 @@ class O9AdminApp {
             }
             if(inputEnrollModulus.focused()) {
                 inputEnrollModulus.handleKey(key);
+                return true;
+            }
+        }
+
+        if(currentTab == 3) {
+            if(auditLog.handleKey(key)) {
                 return true;
             }
         }
@@ -853,6 +904,12 @@ main {
     print("Selected user 1: notice=", app.currentNotice(), "\n");
     app.selectUser(0); // Select alice
     print("Selected user 0: notice=", app.currentNotice(), "\n");
+
+    // Test Revoke selected user
+    app.selectUser(3); // Select charlie
+    app.handleMouse(470, 312, 1); // Click Revoke button
+    app.clickConfirmOk();
+    print("Revoked user charlie. Row count=", app.tableRows(), " notice=", app.currentNotice(), "\n");
 
     // Test DKIM Generation
     app.switchTab(1);
