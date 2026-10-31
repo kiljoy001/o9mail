@@ -232,11 +232,13 @@ On 9front (with native Plan 9 libraries):
 ### 0. Graphical Administration (No Command-Line Required)
 Launch the graphical console inside Rio or drawterm:
 ```rc
+o9mail -i
+# or:
 o9admin -i
 ```
 Or run the built-in self-verification test suite headlessly:
 ```rc
-o9admin
+o9mail
 ```
 The administration panel provides complete control over:
 1. Starting and stopping `smtpd` (inbound engine) and `mailfs` (9P mailbox service).
